@@ -1,0 +1,341 @@
+import { writableReferences } from '../components/composer/editor/referenceText'
+import type { Ref } from 'vue'
+import type {
+  CommandDescriptor,
+  CommandInvocationResult,
+  CommandSurface,
+} from '@emperor/core/api'
+import { core } from '../api/http'
+import {
+  rankSlashPaletteItems,
+  resolveSlashInvocation,
+  buildSlashPaletteItems,
+} from '../commands'
+import type {
+  BootstrapPayload,
+  ChatSendPayload,
+  ControlPayload,
+  MessageReference,
+  PermissionPreset,
+  SessionInfo,
+} from '../types'
+import { createComposerLifecycleController } from './composerLifecycle'
+
+/** Whether a submit was accepted (the composer restores the draft on `false`). */
+export type SendOutcome = boolean | Promise<boolean>
+
+/** How long a typed `/word` waits for a command list that has not loaded. */
+export const COMMAND_LOAD_WAIT_MS = 2000
+
+export interface SlashCommandDeps {
+  boot: Ref<BootstrapPayload | null>
+  busy: Ref<boolean>
+  commandDescriptors: Ref<CommandDescriptor[]>
+  resolveSessionId: () => Promise<string>
+  /** Backend session that control changes apply to (null for drafts). */
+  controlSessionId?: () => string | null
+  /**
+   * The draft on screen, null on a real session (FIX-13): its plan mode and
+   * preset are its own until its first message, so Core is not asked.
+   */
+  draftId?: () => string | null
+  /** Change a draft's own plan mode or preset. */
+  updateDraft?: (
+    id: string,
+    patch: { plan: boolean } | { preset: PermissionPreset },
+  ) => void
+  /** `true` once the host took the message; `false` if it was refused. */
+  sendMessage: (payload: string | ChatSendPayload) => SendOutcome
+  /** Load the command list when it is still empty, waiting at most `timeoutMs`. */
+  ensureCommands?: (timeoutMs: number) => Promise<void>
+  showToast: (message: string) => void
+  /** Sticky error toast with 「复制详情」 (App: showError); else showToast. */
+  showError?: (error: unknown) => void
+  refreshAll: () => Promise<void>
+  openCommandSurface: (
+    surface: CommandSurface,
+    params?: Record<string, unknown>,
+  ) => void | Promise<void>
+  activateTransitionedSession: (session: SessionInfo) => Promise<void>
+}
+
+export function useSlashCommands(deps: SlashCommandDeps) {
+  const queuedPolls = new Map<string, ReturnType<typeof setTimeout>>()
+  const lifecycle = createComposerLifecycleController({
+    currentControl: () => deps.boot.value?.control,
+    agentBusy: () => deps.busy.value,
+    setPlanEnabled: async (enabled) => {
+      await writeControlMode(enabled ? 'plan' : 'default')
+    },
+  })
+
+  /**
+   * Send the composer's message or run its slash command. A `/word` that
+   * names no command goes out as an ordinary message (the composer said so
+   * while it was typed); while the command list is still empty it first
+   * waits for it, at most COMMAND_LOAD_WAIT_MS.
+   */
+  async function submitFromComposer(
+    payload: string | ChatSendPayload,
+  ): Promise<boolean> {
+    const normalized: ChatSendPayload =
+      typeof payload === 'string'
+        ? { content: payload, attachments: [] }
+        : {
+            ...payload,
+            content: String(payload.content ?? ''),
+            attachments: payload.attachments ?? [],
+          }
+    if (normalized.delivery) return await deps.sendMessage(normalized)
+    let invocation = resolveSlashInvocation(
+      normalized.content,
+      deps.commandDescriptors.value,
+    )
+    if (
+      invocation &&
+      !invocation.descriptor &&
+      deps.commandDescriptors.value.length === 0 &&
+      deps.ensureCommands
+    ) {
+      await deps.ensureCommands(COMMAND_LOAD_WAIT_MS).catch(() => undefined)
+      invocation = resolveSlashInvocation(
+        normalized.content,
+        deps.commandDescriptors.value,
+      )
+    }
+    if (!invocation?.descriptor) return await deps.sendMessage(normalized)
+    const result = await executeSlashCommand(
+      invocation.raw,
+      invocation.descriptor,
+      (normalized.attachments ?? []).map((attachment) => attachment.id),
+      // Chip offsets hold for the raw input only when it is the same text.
+      invocation.raw === normalized.content ? normalized.references : undefined,
+    )
+    return result !== null
+  }
+
+  async function executeSlashCommand(
+    rawInput: string,
+    knownDescriptor?: CommandDescriptor,
+    attachments: string[] = [],
+    references?: MessageReference[],
+  ): Promise<CommandInvocationResult | null> {
+    const invocation = resolveSlashInvocation(
+      rawInput,
+      deps.commandDescriptors.value,
+    )
+    const descriptor = knownDescriptor ?? invocation?.descriptor ?? null
+    if (!invocation || !descriptor) {
+      showUnknownCommand(invocation?.name ?? rawInput.replace(/^\//, ''))
+      return null
+    }
+    try {
+      const request = {
+        sessionId: await deps.resolveSessionId(),
+        commandId: descriptor.id,
+        rawInput: invocation.raw,
+        invocationId: createInvocationId(),
+        invocationSource: 'desktop',
+        attachments,
+        ...(references?.length
+          ? { references: writableReferences(references) }
+          : {}),
+      } as const
+      const result = await core('commands.invoke', request)
+      await projectInvocationResult(result)
+      if (result.status === 'queued') scheduleQueuedResultPoll(request)
+      return result
+    } catch (error) {
+      reportError(deps, error)
+      return null
+    }
+  }
+
+  function scheduleQueuedResultPoll(request: {
+    sessionId: string
+    commandId: string
+    rawInput: string
+    invocationId: string
+    invocationSource: 'desktop'
+    attachments: string[]
+  }): void {
+    if (queuedPolls.has(request.invocationId)) return
+    const poll = async () => {
+      try {
+        const result = await core('commands.invoke', request)
+        if (result.status === 'queued') {
+          queuedPolls.set(
+            request.invocationId,
+            globalThis.setTimeout(poll, 750),
+          )
+          return
+        }
+        queuedPolls.delete(request.invocationId)
+        await projectInvocationResult(result)
+      } catch (error) {
+        queuedPolls.delete(request.invocationId)
+        reportError(deps, error)
+      }
+    }
+    queuedPolls.set(request.invocationId, globalThis.setTimeout(poll, 750))
+  }
+
+  async function projectInvocationResult(
+    result: CommandInvocationResult,
+  ): Promise<void> {
+    if (result.status === 'rejected') {
+      deps.showToast(result.message)
+      return
+    }
+    if (result.status === 'queued') {
+      deps.showToast('命令已排队，将在当前任务结束后执行。')
+      return
+    }
+    if (result.status === 'submitted') return
+    if (result.status === 'opened') {
+      await deps.openCommandSurface(result.surface, result.params)
+      return
+    }
+    const receipt = result.receipt
+    if (!receipt) return
+    if (receipt.code === 'session_transitioned') {
+      const session = receipt.data?.session as SessionInfo | undefined
+      if (!session?.id) {
+        deps.showToast('新会话已经创建，但返回结果缺少会话标识。')
+        return
+      }
+      await deps.activateTransitionedSession(session)
+      deps.showToast(receipt.message)
+      return
+    }
+    if (
+      receipt.code === 'model_activated' ||
+      receipt.code === 'reasoning_updated' ||
+      receipt.code === 'permission_mode_updated' ||
+      receipt.code.startsWith('plan_')
+    )
+      await deps.refreshAll()
+    deps.showToast(
+      receipt.replacementSyntax
+        ? `${receipt.message} 新语法：${receipt.replacementSyntax}`
+        : receipt.message,
+    )
+  }
+
+  function showUnknownCommand(name: string): void {
+    const candidates = rankSlashPaletteItems(
+      buildSlashPaletteItems(deps.commandDescriptors.value),
+      name,
+    )
+      .slice(0, 3)
+      .map((item) => item.name)
+    deps.showToast(
+      candidates.length
+        ? `未知命令 /${name}。你是否想输入：${candidates.join('、')}`
+        : `未知命令 /${name}。输入 / 查看可用命令。`,
+    )
+  }
+
+  function applyControl(control: unknown): void {
+    if (!deps.boot.value || !control || typeof control !== 'object') return
+    deps.boot.value.control = control as ControlPayload
+  }
+
+  async function setPermissionMode(
+    preset: PermissionPreset,
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const draft = deps.draftId?.()
+      if (draft) {
+        deps.updateDraft?.(draft, { preset })
+        applyControl({ ...deps.boot.value?.control, preset, mode: preset })
+      } else
+        applyControl(
+          await core(
+            'control.setPermissionMode',
+            preset,
+            deps.controlSessionId?.() ?? null,
+          ),
+        )
+      deps.showToast(`执行权限已切换为${permissionLabel(preset)}`)
+      return { ok: true }
+    } catch (error) {
+      const message = displayError(error)
+      deps.showToast(message)
+      return { ok: false, error: message }
+    }
+  }
+
+  /** Plan mode is a toggle separate from the permission preset. */
+  async function writeControlMode(mode: 'plan' | 'default') {
+    const plan = mode === 'plan'
+    const draft = deps.draftId?.()
+    if (draft) {
+      deps.updateDraft?.(draft, { plan })
+      applyControl({ ...deps.boot.value?.control, plan })
+    } else
+      applyControl(
+        (await core('control.setMode', mode, deps.controlSessionId?.() ?? null))
+          .control,
+      )
+    deps.showToast(plan ? '已进入计划模式' : '已退出计划模式')
+  }
+
+  async function setControlMode(
+    mode: 'plan' | 'default',
+  ): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await writeControlMode(mode)
+      return { ok: true }
+    } catch (error) {
+      const message = displayError(error)
+      deps.showToast(message)
+      return { ok: false, error: message }
+    }
+  }
+
+  async function setPlanEnabled(
+    enabled: boolean,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const result = enabled
+      ? await lifecycle.activatePlan()
+      : await lifecycle.deactivatePlan()
+    return result.ok ? { ok: true } : { ok: false, error: result.error }
+  }
+
+  return {
+    submitFromComposer,
+    executeSlashCommand,
+    setControlMode,
+    setPlanEnabled,
+    setPermissionMode,
+    activatePlan: lifecycle.activatePlan,
+    dismissLifecycle: lifecycle.dismissLifecycle,
+  }
+}
+
+function createInvocationId(): string {
+  const suffix =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now()}_${Math.random().toString(16).slice(2)}`
+  return `desktop_command_${suffix}`
+}
+
+function permissionLabel(preset: PermissionPreset): string {
+  if (preset === 'danger-full-access') return '完全访问'
+  if (preset === 'read-only') return '只读'
+  return '工作区可写'
+}
+
+function reportError(
+  deps: Pick<SlashCommandDeps, 'showToast' | 'showError'>,
+  error: unknown,
+): void {
+  if (deps.showError) deps.showError(error)
+  else deps.showToast(displayError(error))
+}
+
+function displayError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}

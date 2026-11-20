@@ -1,0 +1,23 @@
+{
+  "tool": "image_gen.imagegen",
+  "mode": "generate",
+  "referenceImages": [],
+  "transparentBackground": false,
+  "prompt": "Use case: photorealistic-natural\nAsset type: panoramic banner photograph for the project home of a professional local video editing application, Cutroom.\nPrimary request: an atmospheric but crisp editorial photograph of a real film post-production editing desk. A very tangible graphite-metal video editing controller with a large finely ridged brushed aluminum jog/shuttle wheel, one compact bank of physical keys with a few warm ivory or amber illuminated keycaps, and a single strip of 35mm film catching a narrow amber highlight. A softly out-of-focus cinema monitor in the far background emits a subtle band of steel-blue light.\nComposition: wide cinematic landscape, with the controller and clearly visible wheel concentrated on the RIGHT TWO THIRDS, strongest highlight near x=78%, y=55%; left third is the quiet, naturally dark extension of the desk for overlaid interface text. Frame the desk close at an oblique operator's-eye angle; use a single believable surface, crop-safe central horizontal band. Keep the tactile wheel visible in a 3-to-1 banner cut from the center. Gentle film grain; refined analog photographic feeling and calm premium contrast.\nPalette: graphite charcoal, brushed slate silver, cool steel-blue, sparing warm amber practical light. Realistic soft box grazing the metal; preserve detail in the light and shadow.\nConstraints: one continuous photograph, no graphic design or layout, no titles, no readable letters or numbers, no watermarks, no logos, no human figures, no floating holograms.",
+  "original": {
+    "file": "editing-console-original.png",
+    "toolOutput": "exec-cc4ebe89-7749-4851-9d7d-611df310a480.png",
+    "width": 2172,
+    "height": 724,
+    "bytes": 2028620,
+    "sha256": "069fb25c894f22cd8b7f6c7c5f718f27e269366e008ab7060255cd29b87d23e9"
+  },
+  "runtime": {
+    "file": "desktop/src/renderer/src/assets/cutroom-editing-console.webp",
+    "width": 2172,
+    "height": 724,
+    "bytes": 118644,
+    "sha256": "36fc89740be780e7fac93eb4e136f8e6f2328df915d7b7ad648d8820ef6c77a8",
+    "encoder": "cwebp 1.5.0 -m 6 -q 86"
+  }
+}

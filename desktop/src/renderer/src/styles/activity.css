@@ -1,0 +1,183 @@
+/* ── Markdown body (MarkdownBlock: panels, plan review, file preview) ─────── */
+
+.markdown-body {
+  min-width: 0;
+  max-width: 100%;
+  color: rgb(var(--text-1));
+  font-size: var(--fs-s);
+  line-height: var(--lh-md);
+  overflow-wrap: anywhere;
+}
+
+.markdown-body > :first-child {
+  margin-top: 0;
+}
+
+.markdown-body > * + * {
+  margin-top: var(--space-3);
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+  color: rgb(var(--text-1));
+  font-weight: var(--weight-semibold);
+}
+
+.markdown-body h1 {
+  font-size: var(--fs-hero);
+  line-height: var(--lh-hero);
+}
+
+.markdown-body h2 {
+  font-size: 18px;
+  line-height: var(--lh-md);
+}
+
+.markdown-body h3 {
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+}
+
+.markdown-body a {
+  color: rgb(var(--accent));
+  font-weight: var(--weight-medium);
+  text-decoration-line: underline;
+  text-underline-offset: 4px;
+}
+
+/* 链接/文档 chip 卡：图标用 CSS mask + data-URI SVG(命名色,无 # 过审计),
+   颜色取自 token。比 `.markdown-body a` 更具体,覆盖其下划线与 accent 色。 */
+.markdown-body a.md-link-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25em;
+  padding: 0 0.375em;
+  margin: 0 0.125em;
+  border: 1px solid rgb(var(--stroke-solid));
+  border-radius: var(--r-sm);
+  background: rgb(var(--surface-base));
+  color: rgb(var(--text-1));
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+  vertical-align: baseline;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease;
+}
+
+.markdown-body a.md-link-chip:hover {
+  border-color: rgb(var(--stroke-solid-strong));
+  background: rgb(var(--surface-sunken));
+  color: rgb(var(--text-1));
+}
+
+.markdown-body a.md-link-chip::before {
+  content: '';
+  flex: none;
+  width: 0.875em;
+  height: 0.875em;
+  background-color: rgb(var(--text-3));
+  -webkit-mask: var(--md-link-ico) center / contain no-repeat;
+  mask: var(--md-link-ico) center / contain no-repeat;
+}
+
+.markdown-body a.md-link-chip[data-md-link='web'] {
+  --md-link-ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpath d='M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20'/%3E%3Cpath d='M2 12h20'/%3E%3C/svg%3E");
+  gap: var(--space-1-5);
+  padding: 0 var(--space-0-5);
+  margin-inline: var(--space-1);
+  border: 0;
+  background: transparent;
+  color: rgb(var(--text-link));
+  line-height: 1.85;
+}
+
+.markdown-body a.md-link-chip[data-md-link='web']:hover {
+  background: var(--surface-hover);
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+
+.markdown-body a.md-link-chip[data-md-link='file'] {
+  --md-link-ico: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z'/%3E%3Cpath d='M14 2v4a2 2 0 0 0 2 2h4'/%3E%3C/svg%3E");
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  margin-left: var(--space-5);
+}
+
+.markdown-body ul > :not([hidden]) ~ :not([hidden]),
+.markdown-body ol > :not([hidden]) ~ :not([hidden]) {
+  margin-top: var(--space-1);
+  margin-bottom: 0;
+}
+
+.markdown-body ul {
+  list-style-type: disc;
+}
+
+.markdown-body ol {
+  list-style-type: decimal;
+}
+
+.markdown-body blockquote {
+  padding: var(--space-1) 0 var(--space-1) var(--space-4);
+  border-left-width: 2px;
+  border-color: rgb(var(--stroke-solid-strong));
+  color: rgb(var(--text-2));
+}
+
+.markdown-body code {
+  padding: var(--space-0-5) var(--space-1-5);
+  border-radius: var(--r-xs);
+  background: rgb(var(--surface-sunken));
+  color: rgb(var(--text-1));
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+.markdown-body pre {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: var(--space-3-5);
+  border-width: 1px;
+  border-radius: var(--r-sm);
+  border-color: rgb(var(--stroke-solid));
+  background: rgb(var(--surface-sunken));
+  color: rgb(var(--text-1));
+}
+
+.markdown-body pre code {
+  padding: 0;
+  background-color: transparent;
+}
+
+.markdown-body table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  border-width: 1px;
+  border-radius: var(--r-sm);
+  border-color: rgb(var(--stroke-solid));
+  font-size: var(--fs-s);
+  line-height: var(--lh-xs);
+}
+
+.markdown-body th,
+.markdown-body td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom-width: 1px;
+  border-color: rgb(var(--stroke-solid));
+  text-align: left;
+}
+
+/* Filled color artwork must not become a solid monochrome mask. */
+.markdown-body a.md-link-chip[data-md-color]::before {
+  background: var(--md-link-image) center / contain no-repeat;
+  -webkit-mask: none;
+  mask: none;
+}

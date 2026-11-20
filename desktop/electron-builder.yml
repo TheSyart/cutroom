@@ -1,0 +1,86 @@
+appId: com.video-edit-agent.desktop
+productName: Cutroom
+
+directories:
+  output: dist
+
+beforePack: scripts/before-pack.cjs
+afterPack: scripts/after-pack.cjs
+afterSign: scripts/after-sign.cjs
+
+files:
+  - out/**/*
+  - '!out/native/**/*'
+  - package.json
+  - '!node_modules{,/**/*}'
+extraResources:
+  - from: build/icon.png
+    to: icon.png
+  - from: ../templates
+    to: runtime-defaults/templates
+    filter:
+      - agent/persona.md
+      - agent/motion/SKILL.md
+      - init/MEMORY.md
+      - init/USER.md
+  - from: ../skills
+    to: runtime-defaults/skills
+  - from: ../config/examples/model_config.example.json
+    to: runtime-defaults/model_config.example.json
+  - from: ../.env.example
+    to: runtime-defaults/.env.example
+  - from: build/runtime-defaults-manifest.json
+    to: runtime-defaults/runtime-manifest.json
+  - from: ../README.md
+    to: runtime-defaults/README.md
+
+asar: true
+
+mac:
+  extraFiles:
+    - from: out/native/Emperor Dictation Helper.app
+      to: Library/Helpers/Emperor Dictation Helper.app
+  # Editor dictation runs its helper as Cutroom's child; macOS may show these
+  # strings under Cutroom's name (experiment E-D1).
+  extendInfo:
+    NSMicrophoneUsageDescription: Cutroom 只在你向聊天输入框听写时使用麦克风；声音只在这台 Mac 上处理，不会保存。
+    NSSpeechRecognitionUsageDescription: Cutroom 在这台 Mac 上把你说的话识别成文字，填进聊天输入框；不会发送到网络。
+  target:
+    - dmg
+    - zip
+  category: public.app-category.productivity
+  icon: build/icon.png
+  artifactName: Cutroom-${version}-macos-${arch}.${ext}
+
+# The install window (UI-S12): background.tiff holds the 660×400 art and its
+# @2x; the app and the Applications link sit level with the gold arrow.
+dmg:
+  background: build/background.tiff
+  iconSize: 96
+  window:
+    width: 660
+    height: 400
+  contents:
+    - x: 165
+      y: 185
+      type: file
+    - x: 495
+      y: 185
+      type: link
+      path: /Applications
+
+win:
+  target:
+    - nsis
+  artifactName: Cutroom-${version}-windows-${arch}.${ext}
+
+linux:
+  target:
+    - AppImage
+  executableName: video-edit-agent
+  icon: build/icon.png
+  category: Utility
+  artifactName: Cutroom-${version}-linux-${arch}.${ext}
+
+# Release builds host CoreApi in the Electron main process and read signed
+# runtime defaults directly from the application resources directory.

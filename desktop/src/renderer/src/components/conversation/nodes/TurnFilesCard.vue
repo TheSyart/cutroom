@@ -1,0 +1,399 @@
+<script setup lang="ts">
+import Badge from '../../ui/Badge.vue'
+import { ChevronDown, ChevronUp, FileDiff, Info } from 'lucide-vue-next'
+import { computed } from 'vue'
+import type { TurnFilesChatNode } from '../../../conversation/types'
+import DocumentIcon from '../../ui/DocumentIcon.vue'
+import Tooltip from '../../ui/Tooltip.vue'
+import { useExpansion } from '../chatContext'
+import {
+  COLLAPSED_FILE_ROWS,
+  fileCounts,
+  fileStatusTag,
+  revertSkipLabel,
+  revertSummary,
+  splitFilePath,
+  TASK_SCOPE_LABEL,
+  turnFilesCaption,
+  turnFilesScope,
+  turnFilesSkippedText,
+  turnReviewTitle,
+} from './turnFilesModel'
+
+const props = defineProps<{ node: TurnFilesChatNode }>()
+const data = computed(() => props.node.data)
+const scope = computed(() => turnFilesScope(data.value))
+const expanded = useExpansion(() => `${props.node.key}:files`)
+
+const rows = computed(() => {
+  const skipped = new Map(
+    (data.value.reverted?.skipped ?? []).map((item) => [
+      item.path,
+      revertSkipLabel(item.reason),
+    ]),
+  )
+  const reverted = new Set(data.value.reverted?.reverted ?? [])
+  const files = expanded.value
+    ? data.value.files
+    : data.value.files.slice(0, COLLAPSED_FILE_ROWS)
+  return files.map((file) => ({
+    file,
+    ...splitFilePath(file.path),
+    tag: fileStatusTag(file),
+    counts: fileCounts(file),
+    outcome:
+      skipped.get(file.path) ?? (reverted.has(file.path) ? '已恢复' : null),
+  }))
+})
+const hidden = computed(() => data.value.files.length - COLLAPSED_FILE_ROWS)
+</script>
+
+<template>
+  <section
+    class="turn-files"
+    :data-turn-files="data.turn"
+    :data-task-first-turn="data.task?.firstTurn"
+    :data-state="
+      data.status === 'skipped'
+        ? 'skipped'
+        : data.reverted
+          ? 'reverted'
+          : 'recorded'
+    "
+    :aria-label="turnReviewTitle(scope)"
+  >
+    <p v-if="data.status === 'skipped'" class="skipped">
+      <FileDiff :size="14" aria-hidden="true" />
+      {{ turnFilesSkippedText(data.skipReason, scope) }}
+    </p>
+    <template v-else>
+      <header class="head">
+        <div class="summary">
+          <span class="icon-badge"
+            ><FileDiff :size="20" aria-hidden="true"
+          /></span>
+          <div class="summary-text">
+            <div class="summary-title">
+              <span class="headline"
+                >已编辑 {{ data.totals.files }} 个文件</span
+              >
+              <Tooltip :label="turnFilesCaption(data)">
+                <span
+                  class="scope-info"
+                  role="img"
+                  tabindex="0"
+                  :aria-label="turnFilesCaption(data)"
+                >
+                  <Info :size="14" aria-hidden="true" />
+                </span>
+              </Tooltip>
+            </div>
+            <div class="totals-line">
+              <div
+                class="totals"
+                :aria-label="`新增 ${data.totals.additions} 行，删除 ${data.totals.deletions} 行`"
+              >
+                <span class="add">+{{ data.totals.additions }}</span>
+                <span class="del">−{{ data.totals.deletions }}</span>
+              </div>
+              <span v-if="scope === 'task'" class="scope">{{
+                TASK_SCOPE_LABEL
+              }}</span>
+            </div>
+          </div>
+        </div>
+        <div v-if="data.reverted" class="actions">
+          <span class="reverted">
+            {{ revertSummary(data.reverted) }}
+          </span>
+        </div>
+      </header>
+      <ul class="files">
+        <li v-for="row in rows" :key="row.file.path">
+          <div class="file" :title="row.file.path">
+            <DocumentIcon :path="row.file.path" :size="18" />
+            <span class="file-main">
+              <span class="path"
+                ><span class="dir">{{ row.dir }}</span
+                ><span class="name">{{ row.name }}</span></span
+              >
+              <span
+                v-if="row.tag || row.outcome || 'note' in row.counts"
+                class="file-meta"
+              >
+                <Badge v-if="row.tag">{{ row.tag }}</Badge>
+                <span v-if="row.outcome" class="outcome">{{
+                  row.outcome
+                }}</span>
+                <span v-if="'note' in row.counts" class="note">{{
+                  row.counts.note
+                }}</span>
+              </span>
+            </span>
+            <span v-if="!('note' in row.counts)" class="counts">
+              <span class="add">{{ row.counts.additions }}</span>
+              <span class="del">{{ row.counts.deletions }}</span>
+            </span>
+          </div>
+        </li>
+      </ul>
+      <div v-if="hidden > 0 || data.truncated" class="foot">
+        <button
+          v-if="hidden > 0"
+          type="button"
+          class="more"
+          :aria-expanded="expanded"
+          @click="expanded = !expanded"
+        >
+          {{ expanded ? '收起文件列表' : `再显示 ${hidden} 个文件` }}
+          <component
+            :is="expanded ? ChevronUp : ChevronDown"
+            :size="14"
+            aria-hidden="true"
+          />
+        </button>
+        <span v-if="data.truncated" class="limit">仅显示前 200 个文件</span>
+      </div>
+    </template>
+  </section>
+</template>
+
+<style scoped>
+.turn-files {
+  container-type: inline-size;
+  overflow: hidden;
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-card);
+  background: rgb(var(--surface-base));
+  font-size: var(--fs-s);
+  line-height: var(--lh-s);
+}
+
+.skipped {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  color: rgb(var(--text-2));
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3-5) var(--space-4);
+}
+
+.summary {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.icon-badge {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: calc(var(--space-8) + var(--space-2));
+  height: calc(var(--space-8) + var(--space-2));
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-row);
+  background: rgb(var(--surface-canvas));
+  color: rgb(var(--text-2));
+}
+
+.summary-text {
+  min-width: 0;
+}
+
+.summary-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.headline {
+  font-weight: var(--weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.scope-info {
+  display: inline-flex;
+  border-radius: var(--r-xs);
+  color: rgb(var(--text-3));
+  cursor: help;
+}
+
+.scope-info:focus-visible,
+.more:focus-visible {
+  outline: 2px solid rgb(var(--focus-ring));
+  outline-offset: 3px;
+}
+
+.totals-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin-top: var(--space-0-5);
+}
+
+.totals {
+  display: flex;
+  gap: var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+}
+
+.scope {
+  color: rgb(var(--text-3));
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+}
+
+.add,
+.del {
+  font-variant-numeric: tabular-nums;
+}
+
+.add {
+  color: rgb(var(--ok));
+}
+
+.del {
+  color: rgb(var(--error));
+}
+
+.actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1-5);
+}
+
+.reverted {
+  color: rgb(var(--text-2));
+  font-size: var(--fs-xs);
+}
+
+.files {
+  margin: 0;
+  padding: var(--space-1) 0;
+  border-top: 1px solid var(--stroke-2);
+  background: rgb(var(--surface-canvas) / 0.3);
+  list-style: none;
+}
+
+.file {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2-5);
+  width: 100%;
+  min-height: calc(calc(var(--space-8) + var(--space-2)) + var(--space-1));
+  padding: var(--space-2-5) var(--space-4);
+  border: 0;
+  background: transparent;
+  color: rgb(var(--text-1));
+  font-size: var(--fs-xs);
+  line-height: var(--lh-s);
+  text-align: start;
+  cursor: default;
+}
+
+.file:hover {
+  background: var(--surface-hover);
+}
+
+.file:focus-visible {
+  outline: 2px solid rgb(var(--focus-ring));
+  outline-offset: -3px;
+}
+
+.file-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.path {
+  display: block;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.dir {
+  color: rgb(var(--text-3));
+}
+
+.name {
+  color: rgb(var(--text-1));
+}
+
+.file-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-0-5);
+  color: rgb(var(--text-2));
+  font-size: var(--fs-xxs);
+  line-height: var(--lh-xxs);
+  overflow-wrap: anywhere;
+}
+
+.counts {
+  display: inline-flex;
+  flex: none;
+  gap: var(--space-1-5);
+  align-self: center;
+  font-size: var(--fs-xs);
+}
+
+.foot {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  border-top: 1px solid var(--stroke-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+}
+
+.more {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  padding: var(--space-2-5) var(--space-4);
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: rgb(var(--text-2));
+  font: inherit;
+  cursor: pointer;
+}
+
+.more:hover {
+  color: rgb(var(--text-1));
+  background: var(--surface-hover);
+}
+
+.limit {
+  padding: var(--space-2) var(--space-4);
+  color: rgb(var(--text-3));
+  font-size: var(--fs-xxs);
+}
+
+@container (max-width: 420px) {
+  .head {
+    flex-wrap: wrap;
+  }
+
+  .actions {
+    margin-inline-start: calc(
+      calc(var(--space-8) + var(--space-2)) + var(--space-3)
+    );
+  }
+}
+</style>

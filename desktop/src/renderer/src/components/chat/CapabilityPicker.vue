@@ -1,0 +1,54 @@
+<script setup lang="ts">
+import type {
+  CapabilityPickerGroup,
+  CapabilityPickerItem,
+} from '../../capabilities/capabilityPicker'
+
+const props = defineProps<{
+  groups: CapabilityPickerGroup[]
+  heading: string
+  hint: string
+  mode: 'add' | 'slash' | 'mention'
+  activeId?: string
+}>()
+
+const emit = defineEmits<{
+  select: [item: CapabilityPickerItem]
+}>()
+</script>
+
+<template>
+  <div class="composer-palette capability-picker" :data-mode="props.mode">
+    <div v-if="props.mode === 'add'" class="composer-palette-head">
+      <span>{{ props.heading }}</span>
+      <em>{{ props.hint }}</em>
+    </div>
+
+    <section
+      v-for="group in props.groups"
+      :key="group.label"
+      class="composer-palette-group"
+    >
+      <div class="composer-palette-label">{{ group.label }}</div>
+      <button
+        v-for="item in group.items"
+        :key="item.id"
+        type="button"
+        class="composer-palette-item capability-picker-item"
+        :class="{ active: item.id === props.activeId }"
+        :data-action="item.action"
+        :data-tone="item.tone || 'slate'"
+        :data-unavailable="item.disabled || undefined"
+        :aria-current="item.id === props.activeId ? 'true' : undefined"
+        @click="emit('select', item)"
+      >
+        <span class="composer-palette-item-icon">
+          <component :is="item.icon" :size="16" />
+        </span>
+        <strong>{{ item.label }}</strong>
+        <span>{{ item.description }}</span>
+        <b v-if="item.meta">{{ item.meta }}</b>
+      </button>
+    </section>
+  </div>
+</template>

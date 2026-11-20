@@ -1,0 +1,274 @@
+/**
+ * Computer Use session events (spec 00 §10.1) and crash repair (§10.2).
+ *
+ * Journal rule: `ui/action-prepared` is written before a driver is asked to
+ * act, `ui/action-dispatched` right before the first side effect, and
+ * `ui/action-settled` once the outcome is known. Repair never replays an
+ * action: a dispatched action without an outcome becomes `unknown`.
+ *
+ * Text typed into pages is never copied here — `fill` / `typeText` keep only
+ * the length and SHA-256 (the text already sits in `tool/call`).
+ */
+
+import { createHash } from 'node:crypto'
+import type { RepairContributor, RepairStep } from '../../session-log/store'
+import type {
+  ActionOutcome,
+  ControlState,
+  CredentialField,
+  DriverKind,
+  GrantDisplayInput,
+  RedactedUiAction,
+  TargetKind,
+  UiAction,
+  UiActionClass,
+  UiGrantScope,
+  UiTargetScope,
+  DownloadState,
+} from './types'
+
+export type TargetClosedReason =
+  'user' | 'agent' | 'lost' | 'revoked' | 'shutdown'
+/**
+ * Why targets were released (2026-09-29 §3.3); `agent`: the Agent released
+ * one early (ui_release_control). `emergency-stop` (and the `kill-switch`
+ * causes below) are no longer written since the emergency stop was retired
+ * (2026-10-01); older session logs still carry them.
+ */
+export type TaskReleaseReason =
+  'task-end' | 'session-deleted' | 'switched-off' | 'emergency-stop' | 'agent'
+export type GrantDecision = UiGrantScope | 'denied'
+export type GrantDecisionCause =
+  'user' | 'cancelled' | 'unavailable' | 'invalid' | 'repair' | 'kill-switch'
+
+declare module '../../session-log/types' {
+  interface SessionEventMap {
+    'ui/target-opened': {
+      targetId: string
+      kind: TargetKind
+      driver: DriverKind
+      generation: number
+      profileId?: string
+      appId?: string
+      title?: string
+      origin?: string
+    }
+    'ui/target-closed': { targetId: string; reason: TargetClosedReason }
+    /** The task ended: control given up, nothing closed (§3.3). */
+    'ui/target-released': {
+      targetId: string
+      reason: TaskReleaseReason
+      outcome: 'released' | 'failed'
+      error?: string
+    }
+    /** Written once every target of the task is released (or failed). */
+    'ui/task-released': {
+      reason: TaskReleaseReason
+      released: number
+      failed: number
+    }
+    'ui/grant-requested': {
+      requestId: string
+      subject: string
+      driver: DriverKind
+      targetScope: UiTargetScope
+      actions: UiActionClass[]
+      allowedScopes: UiGrantScope[]
+      reason?: string
+      callId?: string
+      toolName?: string
+      /** What the card shows: the full URL or the app/window name. */
+      display?: {
+        url?: string
+        title?: string
+        appName?: string
+        embeddedIn?: string
+        /** Keyboard input the card asks about (never a secret). */
+        input?: GrantDisplayInput
+      }
+      highImpact?: boolean
+      background?: boolean
+    }
+    'ui/grant-decided': {
+      requestId: string
+      decision: GrantDecision
+      grantId?: string
+      expiresAt?: string
+      /** Timed grants: the chosen duration. */
+      minutes?: number
+      backgroundAllowed?: boolean
+      cause?: GrantDecisionCause
+    }
+    'ui/grant-revoked': {
+      grantId: string
+      by: 'user' | 'expiry' | 'kill-switch'
+    }
+    'ui/grant-delegated': {
+      grantId: string
+      sourceGrantId: string
+      childId: string
+      actions: UiActionClass[]
+      targetScope: UiTargetScope
+    }
+    'ui/action-prepared': {
+      operationId: string
+      callId: string
+      targetId: string
+      action: RedactedUiAction
+      expectedRevision: number
+      actionClass?: UiActionClass
+      grantId?: string
+    }
+    'ui/action-dispatched': { operationId: string }
+    'ui/action-settled': {
+      operationId: string
+      outcome: ActionOutcome
+      afterRevision?: number
+      errorCode?: string
+    }
+    'ui/control-state': { targetId?: string; state: ControlState }
+    /** An action auto-approved by the persisted Computer Use mode. */
+    'ui/auto-approved': {
+      operationId: string
+      preset: 'danger-full-access' | 'computer-use-unrestricted'
+      actionClass: UiActionClass
+    }
+    /** Credential autofill; never carries a value. */
+    'ui/credential-used': {
+      operationId: string
+      handleId: string
+      targetId: string
+      bindingMatched: string
+      field: CredentialField
+    }
+    /** A download into the inbox finished (or was refused). No file content. */
+    'ui/download': {
+      operationId: string
+      targetId: string
+      downloadId: string
+      state: DownloadState
+      filename: string
+      bytes: number
+      sha256?: string
+      /** Origin of the download URL. */
+      origin?: string
+      /** The download URL (bounded). */
+      url?: string
+      mimeType?: string
+      /** Origin of the page that started the download. */
+      pageOrigin?: string
+    }
+    /** Files the user picked were put into a file input. Names only. */
+    'ui/upload': {
+      operationId: string
+      targetId: string
+      files: string[]
+      bytes: number
+    }
+  }
+}
+
+function digest(text: string): { textLength: number; textSha256: string } {
+  return {
+    textLength: text.length,
+    textSha256: createHash('sha256').update(text, 'utf8').digest('hex'),
+  }
+}
+
+/** The journal form of an action: typed text is reduced to length + hash. */
+export function redactAction(action: UiAction): RedactedUiAction {
+  switch (action.kind) {
+    case 'fill':
+    case 'appendText':
+      return { kind: action.kind, ref: action.ref, ...digest(action.text) }
+    case 'typeText':
+      return {
+        kind: 'typeText',
+        ...(action.ref === undefined ? {} : { ref: action.ref }),
+        ...digest(action.text),
+      }
+    default:
+      return action
+  }
+}
+
+type Repair = RepairStep
+
+/**
+ * §10.2 crash repair:
+ * - prepared, never dispatched → settled `cancelled`
+ * - dispatched, never settled → settled `unknown` (never replayed)
+ * - grant asked, never decided → decided `denied` (fail closed)
+ * - target opened, never closed or released → closed `shutdown`
+ */
+export const computerUseRepair: RepairContributor = {
+  id: 'computer-use',
+  pairs: [
+    ['ui/action-prepared', 'ui/action-settled'],
+    ['ui/action-dispatched', 'ui/action-settled'],
+    ['ui/grant-requested', 'ui/grant-decided'],
+    ['ui/target-opened', 'ui/target-closed'],
+  ],
+  repair(events) {
+    const prepared = new Map<string, number>()
+    const dispatched = new Map<string, number>()
+    const grants = new Map<string, number>()
+    const targets = new Map<string, number>()
+    for (const event of events) {
+      switch (event.type) {
+        case 'ui/action-prepared':
+          prepared.set(event.data.operationId, event.seq)
+          break
+        case 'ui/action-dispatched':
+          prepared.delete(event.data.operationId)
+          dispatched.set(event.data.operationId, event.seq)
+          break
+        case 'ui/action-settled':
+          prepared.delete(event.data.operationId)
+          dispatched.delete(event.data.operationId)
+          break
+        case 'ui/grant-requested':
+          grants.set(event.data.requestId, event.seq)
+          break
+        case 'ui/grant-decided':
+          grants.delete(event.data.requestId)
+          break
+        case 'ui/target-opened':
+          targets.set(event.data.targetId, event.seq)
+          break
+        case 'ui/target-closed':
+        case 'ui/target-released':
+          targets.delete(event.data.targetId)
+          break
+        default:
+          break
+      }
+    }
+    const out: Repair[] = []
+    for (const [operationId, openedAt] of prepared)
+      out.push({
+        type: 'ui/action-settled',
+        data: { operationId, outcome: 'cancelled', errorCode: 'INTERRUPTED' },
+        openedAt,
+      } as Repair)
+    for (const [operationId, openedAt] of dispatched)
+      out.push({
+        type: 'ui/action-settled',
+        data: { operationId, outcome: 'unknown', errorCode: 'OUTCOME_UNKNOWN' },
+        openedAt,
+      } as Repair)
+    for (const [requestId, openedAt] of grants)
+      out.push({
+        type: 'ui/grant-decided',
+        data: { requestId, decision: 'denied', cause: 'repair' },
+        openedAt,
+      } as Repair)
+    for (const [targetId, openedAt] of targets)
+      out.push({
+        type: 'ui/target-closed',
+        data: { targetId, reason: 'shutdown' },
+        openedAt,
+      } as Repair)
+    return out
+  },
+}

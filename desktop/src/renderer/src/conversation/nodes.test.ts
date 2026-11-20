@@ -1,0 +1,1179 @@
+import { describe, expect, it } from 'vitest'
+import { deepEqual } from './assembler'
+import { chatSnapshotOf, createConversationAssembler } from './chatSnapshot'
+import { TOOL_DRAFT_LIMIT } from './events'
+import {
+  describeNodes,
+  LogBuilder,
+  nodeOf,
+  replay,
+  stream,
+  structural,
+} from './testing/fixtures'
+
+function expectConverges(log: LogBuilder): void {
+  const replayed = replay(log.events).snapshot
+  const streamed = stream(log.events).snapshot
+  expect(deepEqual(structural(streamed), structural(replayed))).toBe(true)
+}
+describe('external agent streaming', () => {
+  it('attaches partial text and tool activity before the parent tool returns, then retains terminal state', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.call(1, 1, 'external-call', 'subagent', {
+      backend: 'codex',
+      description: 'work',
+    })
+    const projection = (extra: Record<string, unknown>) =>
+      log.add('delegation/projection', {
+        delegation_id: 'dlg-one',
+        run_id: 'dgr-one',
+        current_run_id: 'dgr-one',
+        parent_call_id: 'external-call',
+        backend: 'codex',
+        journal_seq: 1,
+        ...extra,
+      })
+    projection({ event: 'delegation_run_changed', task: { status: 'running' } })
+    projection({
+      event: 'delegation_output',
+      output: [
+        { role: 'assistant', content: 'Hello ' },
+        {
+          role: 'tool',
+          content: JSON.stringify({
+            type: 'tool_started',
+            name: 'shell',
+            detail: 'read README.md',
+          }),
+        },
+        { role: 'assistant', content: 'world' },
+      ],
+    })
+    expect(
+      nodeOf(replay(log.events).snapshot, 'tool').data.externalAgent,
+    ).toMatchObject({
+      backend: 'codex',
+      phase: 'running',
+      text: 'Hello world',
+      activity: [expect.objectContaining({ name: 'shell', status: 'running' })],
+    })
+    projection({
+      event: 'delegation_run_changed',
+      task: { status: 'completed' },
+    })
+    expect(
+      nodeOf(replay(log.events).snapshot, 'tool').data.externalAgent?.phase,
+    ).toBe('completed')
+    expectConverges(log)
+  })
+  it('updates the named tool by native identity when parallel tools finish', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.call(1, 1, 'external-call', 'subagent', { backend: 'codex' })
+    for (const tool of [
+      { type: 'tool_started', id: 'read', name: 'Read' },
+      { type: 'tool_started', id: 'shell', name: 'shell' },
+      { type: 'tool_finished', id: 'read', status: 'completed' },
+      { type: 'tool_finished', id: 'shell', status: 'failed' },
+    ])
+      log.add('delegation/projection', {
+        event: 'delegation_output',
+        delegation_id: 'dlg-tools',
+        run_id: 'dgr-tools',
+        parent_call_id: 'external-call',
+        backend: 'codex',
+        journal_seq: 1,
+        output: [{ role: 'tool', content: JSON.stringify(tool) }],
+      })
+    expect(
+      nodeOf(replay(log.events).snapshot, 'tool').data.externalAgent?.activity,
+    ).toEqual([
+      { id: 'read', name: 'Read', status: 'completed' },
+      { id: 'shell', name: 'shell', status: 'failed' },
+    ])
+    expectConverges(log)
+  })
+  it('reconstructs older runs from result metadata and ignores an old run after a followup starts', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.call(1, 1, 'legacy-call', 'subagent', { backend: 'claude-code' })
+    log.add('delegation/projection', {
+      event: 'delegation_output',
+      delegation_id: 'dlg-old',
+      run_id: 'dgr-old',
+      journal_seq: 1,
+      output: [{ role: 'assistant', content: 'old output' }],
+    })
+    log.result(1, 1, 'legacy-call', 'finished', {
+      meta: {
+        kind: 'foreground',
+        backend: 'claude-code',
+        subagentId: 'dlg-old',
+        runId: 'dgr-old',
+      },
+    })
+    expect(
+      nodeOf(replay(log.events).snapshot, 'tool').data.externalAgent?.text,
+    ).toBe('old output')
+    log.add('delegation/projection', {
+      event: 'delegation_run_changed',
+      delegation_id: 'dlg-old',
+      run_id: 'dgr-new',
+      current_run_id: 'dgr-new',
+      parent_call_id: 'legacy-call',
+      backend: 'claude-code',
+      journal_seq: 2,
+      task: { status: 'running' },
+    })
+    log.add('delegation/projection', {
+      event: 'delegation_run_changed',
+      delegation_id: 'dlg-old',
+      run_id: 'dgr-old',
+      current_run_id: 'dgr-new',
+      parent_call_id: 'legacy-call',
+      backend: 'claude-code',
+      journal_seq: 3,
+      task: { status: 'completed' },
+    })
+    expect(
+      nodeOf(replay(log.events).snapshot, 'tool').data.externalAgent,
+    ).toMatchObject({ runId: 'dgr-new', phase: 'running', text: '' })
+    expectConverges(log)
+  })
+})
+
+describe('assistant streaming', () => {
+  it('folds chunks into blocks and publishes deltas per frame', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    const assembler = createConversationAssembler()
+    assembler.replaceWindow(log.events, false)
+    assembler.flush()
+    expect(chatSnapshotOf(assembler).running).toBe(true)
+    expect(chatSnapshotOf(assembler).turnStatus?.turn).toBe(1)
+
+    const steps: Array<[unknown, string]> = [
+      [
+        { type: 'block-start', index: 0, blockType: 'reasoning' },
+        'animation-frame',
+      ],
+      [{ type: 'reasoning-delta', index: 0, text: 'think' }, 'animation-frame'],
+      [{ type: 'block-start', index: 1, blockType: 'text' }, 'animation-frame'],
+      [{ type: 'text-delta', index: 1, text: 'Hel' }, 'animation-frame'],
+      [{ type: 'text-delta', index: 1, text: 'lo' }, 'animation-frame'],
+      [
+        { type: 'block-start', index: 2, blockType: 'tool-call' },
+        'animation-frame',
+      ],
+      [
+        {
+          type: 'tool-call-delta',
+          index: 2,
+          id: 'c1',
+          name: 'bash',
+          argumentsDelta: '{"co',
+        },
+        'animation-frame',
+      ],
+      [{ type: 'usage', usage: { inputTokens: 5, outputTokens: 7 } }, 'none'],
+    ]
+    for (const [chunk, publication] of steps) {
+      expect(assembler.append(log.chunk(1, 1, chunk))).toBe(publication)
+    }
+    assembler.flush()
+    const running = nodeOf(chatSnapshotOf(assembler), 'assistant')
+    expect(running.data.status).toBe('running')
+    expect(running.data.blocks).toEqual([
+      { kind: 'reasoning', text: 'think' },
+      { kind: 'text', text: 'Hello' },
+      // DSH-23: the arguments streamed so far ride along while preparing.
+      { kind: 'tool-call', callId: 'c1', name: 'bash', draft: '{"co' },
+    ])
+    expect(running.data.usage).toEqual({ inputTokens: 5, outputTokens: 7 })
+
+    expect(
+      assembler.append(
+        log.message(1, 1, [
+          { type: 'reasoning', text: 'think' },
+          { type: 'text', text: 'Hello' },
+        ]),
+      ),
+    ).toBe('immediate')
+    assembler.flush()
+    const settled = nodeOf(chatSnapshotOf(assembler), 'assistant')
+    expect(settled.data.status).toBe('settled')
+    expect(settled.data.timing?.firstTokenTime).not.toBeNull()
+    expect(settled.anchorSeq).toBe(log.events.at(-1)?.seq)
+  })
+
+  it('keeps a running tool call name when a later delta from an older log carries an empty one', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.chunk(1, 1, { type: 'block-start', index: 0, blockType: 'text' })
+    log.chunk(1, 1, { type: 'text-delta', index: 0, text: 'Listing.' })
+    log.chunk(1, 1, { type: 'block-start', index: 1, blockType: 'tool-call' })
+    log.chunk(1, 1, {
+      type: 'tool-call-delta',
+      index: 1,
+      id: 'c1',
+      name: 'bash',
+      argumentsDelta: '{"co',
+    })
+    log.chunk(1, 1, {
+      type: 'tool-call-delta',
+      index: 1,
+      id: '',
+      name: '',
+      argumentsDelta: 'mmand":"ls"}',
+    })
+    const running = nodeOf(replay(log.events).snapshot, 'assistant')
+    expect(running.data.blocks).toEqual([
+      { kind: 'text', text: 'Listing.' },
+      {
+        kind: 'tool-call',
+        callId: 'c1',
+        name: 'bash',
+        draft: '{"command":"ls"}',
+      },
+    ])
+  })
+
+  it('keeps a capped draft of the streamed arguments until the message lands (DSH-23)', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.chunk(1, 1, { type: 'block-start', index: 0, blockType: 'tool-call' })
+    log.chunk(1, 1, {
+      type: 'tool-call-delta',
+      index: 0,
+      id: 'c1',
+      name: 'write',
+      argumentsDelta: '{"file_path":"a.ts","content":"',
+    })
+    log.chunk(1, 1, {
+      type: 'tool-call-delta',
+      index: 0,
+      id: 'c1',
+      name: 'write',
+      argumentsDelta: 'x'.repeat(TOOL_DRAFT_LIMIT * 2),
+    })
+    const draft = (): string | undefined => {
+      // A step holding only a call is a hidden node: read it by kind.
+      const node = [...replay(log.events).snapshot.nodes.values()].find(
+        (item) => item.kind === 'assistant',
+      )
+      const block = node?.kind === 'assistant' ? node.data.blocks[0] : undefined
+      return block?.kind === 'tool-call' ? block.draft : undefined
+    }
+    expect(draft()?.startsWith('{"file_path":"a.ts","content":"x')).toBe(true)
+    expect(draft()).toHaveLength(TOOL_DRAFT_LIMIT)
+    // block-end carries the assembled call: the draft is its capped arguments.
+    log.chunk(1, 1, {
+      type: 'block-end',
+      index: 0,
+      block: {
+        type: 'tool-call',
+        id: 'c1',
+        name: 'write',
+        arguments: '{"file_path":"a.ts","content":"short"}',
+      },
+    })
+    expect(draft()).toBe('{"file_path":"a.ts","content":"short"}')
+    log.message(1, 1, [
+      {
+        type: 'tool-call',
+        id: 'c1',
+        name: 'write',
+        arguments: '{"file_path":"a.ts","content":"short"}',
+      },
+    ])
+    expect(draft()).toBeUndefined()
+    expectConverges(log)
+  })
+
+  it('discards the failed attempt on llm/retry and shows the retry row', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.chunk(1, 1, { type: 'block-start', index: 0, blockType: 'text' })
+    log.chunk(1, 1, { type: 'text-delta', index: 0, text: 'broken answ' })
+    log.chunk(1, 1, {
+      type: 'finish',
+      reason: { kind: 'error', failure: { message: 'boom', code: 'SERVER' } },
+    })
+    log.add('llm/retry', {
+      retryId: 'r1',
+      turn: 1,
+      step: 1,
+      provider: 'p',
+      mode: 'normal',
+      policyKey: 'k',
+      retry: 1,
+      maxRetries: 3,
+      delayMs: 2000,
+      failure: { message: 'boom', code: 'SERVER', status: 503 },
+    })
+    let { snapshot } = replay(log.events)
+    expect(describeNodes(snapshot)).toEqual(['retry: 1:scheduled'])
+    expect(nodeOf(snapshot, 'retry').data.current).toMatchObject({
+      delayMs: 2000,
+      message: 'boom (503)',
+    })
+
+    log.add('llm/retry-started', { retryId: 'r1', turn: 1, step: 1 })
+    log.chunk(1, 1, { type: 'block-start', index: 0, blockType: 'text' })
+    log.chunk(1, 1, { type: 'text-delta', index: 0, text: 'good' })
+    log.message(1, 1, [{ type: 'text', text: 'good' }])
+    snapshot = replay(log.events).snapshot
+    expect(describeNodes(snapshot)).toEqual([
+      'retry: 1:started',
+      'assistant[settled]: text=good',
+    ])
+    expectConverges(log)
+  })
+
+  it('cancels a scheduled retry when the step closes first', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.add('llm/retry', {
+      retryId: 'r1',
+      turn: 1,
+      step: 1,
+      provider: 'p',
+      mode: 'always',
+      policyKey: 'k',
+      retry: 1,
+      delayMs: 5000,
+      failure: { message: 'rate', code: 'RATE_LIMIT' },
+    })
+    log.add('step/end', { turn: 1, step: 1 })
+    log.add('turn/end', {
+      turn: 1,
+      reason: { kind: 'aborted', reason: { kind: 'user' } },
+    })
+    expect(describeNodes(replay(log.events).snapshot)).toEqual([
+      'retry: 1:cancelled',
+    ])
+  })
+})
+
+describe('interruption', () => {
+  it('freezes the partial assistant and running tools when the turn aborts', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.user('u1', 'go')
+    log.add('step/start', { turn: 1, step: 1 })
+    log.message(1, 1, [
+      { type: 'tool-call', id: 'c1', name: 'bash', arguments: '{}' },
+    ])
+    log.call(1, 1, 'c1', 'bash', { command: 'sleep 100' })
+    log.add('step/end', { turn: 1, step: 1 })
+    log.add('step/start', { turn: 1, step: 2 })
+    log.chunk(1, 2, { type: 'block-start', index: 0, blockType: 'text' })
+    log.chunk(1, 2, { type: 'text-delta', index: 0, text: 'partial' })
+    const before = replay(log.events).snapshot
+    expect(before.running).toBe(true)
+    expect(describeNodes(before)).toEqual([
+      'user: go',
+      'tool[interrupted]: bash',
+      'assistant[running]: text=partial',
+    ])
+    const end = log.add('turn/end', {
+      turn: 1,
+      reason: { kind: 'aborted', reason: { kind: 'user' } },
+    })
+    const after = replay(log.events).snapshot
+    expect(after.running).toBe(false)
+    expect(describeNodes(after)).toEqual([
+      'user: go',
+      'tool[interrupted]: bash',
+      'assistant[interrupted]: text=partial',
+    ])
+    expect(nodeOf(after, 'assistant').anchorSeq).toBeCloseTo(end.seq - 0.9)
+    expectConverges(log)
+  })
+
+  it('marks a crash-repaired turn interrupted and a live tool running', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.call(1, 1, 'c1', 'read', {})
+    expect(nodeOf(replay(log.events).snapshot, 'tool').data.status).toBe(
+      'running',
+    )
+    log.add('turn/end', { turn: 1, reason: { kind: 'interrupted' } })
+    expect(nodeOf(replay(log.events).snapshot, 'tool').data.status).toBe(
+      'interrupted',
+    )
+  })
+})
+
+describe('tools', () => {
+  it('keeps parallel calls in call order with their own results', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.call(1, 1, 'a', 'read', { path: 'a' })
+    log.call(1, 1, 'b', 'read', { path: 'b' })
+    log.result(1, 1, 'b', 'B!')
+    log.result(1, 1, 'a', 'A!', { isError: true })
+    const { snapshot } = replay(log.events)
+    expect(describeNodes(snapshot)).toEqual([
+      'tool[settled]: read',
+      'tool[settled]: read',
+    ])
+    expect(nodeOf(snapshot, 'tool', 0).data).toMatchObject({
+      callId: 'a',
+      argsRaw: '{"path":"a"}',
+      result: { isError: true, content: [{ type: 'text', text: 'A!' }] },
+    })
+    expect(nodeOf(snapshot, 'tool', 1).data.result?.content).toEqual([
+      { type: 'text', text: 'B!' },
+    ])
+    expectConverges(log)
+  })
+
+  it('settles a background subagent after its call result', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.call(1, 1, 'd', 'subagent', { description: 'bg' })
+    log.add('subagent/started', {
+      subagentId: 'sub-1',
+      description: 'bg',
+      mode: 'spawn',
+      background: true,
+      callId: 'd',
+    })
+    log.result(1, 1, 'd', 'started sub-1')
+    log.add('step/end', { turn: 1, step: 1 })
+    log.add('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    let tool = nodeOf(replay(log.events).snapshot, 'tool')
+    expect(tool.data.subagent).toMatchObject({
+      subagentId: 'sub-1',
+      background: true,
+      status: 'running',
+    })
+    log.add('subagent/settled', {
+      subagentId: 'sub-1',
+      stopReason: 'completed',
+      text: 'done',
+    })
+    tool = nodeOf(replay(log.events).snapshot, 'tool')
+    expect(tool.data.subagent).toMatchObject({
+      status: 'settled',
+      text: 'done',
+    })
+    expectConverges(log)
+  })
+
+  it('keeps when a subagent started and settled (UI-S14: its row says how long)', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.call(1, 1, 'd', 'subagent', { description: 'bg' })
+    const started = log.add('subagent/started', {
+      subagentId: 'sub-1',
+      description: 'bg',
+      mode: 'spawn',
+      background: true,
+      callId: 'd',
+    })
+    log.result(1, 1, 'd', 'started sub-1')
+    const settled = log.add('subagent/settled', {
+      subagentId: 'sub-1',
+      stopReason: 'completed',
+      text: 'done',
+    })
+    const tool = nodeOf(replay(log.events).snapshot, 'tool')
+    expect(tool.data.subagent).toMatchObject({
+      startedAt: (started as { time: number }).time,
+      settledAt: (settled as { time: number }).time,
+    })
+    expectConverges(log)
+  })
+
+  it('keeps an external run’s start, end and summary (UI-S14)', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.call(1, 1, 'x', 'subagent', { backend: 'codex', description: 'w' })
+    const projection = (task: Record<string, unknown>) =>
+      log.add('delegation/projection', {
+        event: 'delegation_run_changed',
+        delegation_id: 'dlg-one',
+        run_id: 'dgr-one',
+        current_run_id: 'dgr-one',
+        parent_call_id: 'x',
+        backend: 'codex',
+        journal_seq: 1,
+        task,
+      })
+    projection({ status: 'running', started_at: 1000, finished_at: null })
+    expect(
+      nodeOf(replay(log.events).snapshot, 'tool').data.externalAgent,
+    ).toMatchObject({ startedAt: 1000 })
+    expect(
+      nodeOf(replay(log.events).snapshot, 'tool').data.externalAgent,
+    ).not.toHaveProperty('finishedAt')
+    projection({
+      status: 'failed',
+      started_at: 1000,
+      finished_at: 15_000,
+      detail: '模型被这个账号拒绝（400）',
+    })
+    expect(
+      nodeOf(replay(log.events).snapshot, 'tool').data.externalAgent,
+    ).toMatchObject({
+      phase: 'failed',
+      startedAt: 1000,
+      finishedAt: 15_000,
+      detail: '模型被这个账号拒绝（400）',
+    })
+    expectConverges(log)
+  })
+
+  it('attaches a background job even when it finishes before the result', () => {
+    for (const early of [true, false]) {
+      const log = new LogBuilder()
+      log.add('turn/start', { turn: 1 })
+      log.add('step/start', { turn: 1, step: 1 })
+      log.call(1, 1, 'j', 'bash', { command: 'make', run_in_background: true })
+      log.add('job/started', {
+        jobId: 'job-1',
+        kind: 'process',
+        command: 'make',
+      })
+      const finished = {
+        jobId: 'job-1',
+        kind: 'process',
+        command: 'make',
+        status: 'completed',
+        exitCode: 0,
+      }
+      if (early) log.add('job/finished', finished)
+      log.result(1, 1, 'j', 'started background job job-1', {
+        meta: { kind: 'background', jobId: 'job-1' },
+      })
+      if (!early) {
+        expect(nodeOf(replay(log.events).snapshot, 'tool').data.job).toEqual({
+          jobId: 'job-1',
+          status: 'running',
+        })
+        log.add('job/finished', finished)
+      }
+      expect(nodeOf(replay(log.events).snapshot, 'tool').data.job).toEqual({
+        jobId: 'job-1',
+        status: 'completed',
+        exitCode: 0,
+      })
+      expectConverges(log)
+    }
+  })
+
+  it('attaches approval escalations to the call', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.call(1, 1, 'w', 'bash', { command: 'touch x' })
+    log.add('approval/asked', {
+      id: 'ap1',
+      toolName: 'bash',
+      callId: 'w',
+      reason: 'escalate sandbox',
+    })
+    expect(describeNodes(replay(log.events).snapshot)).toEqual([
+      'tool[running]: bash approvals=pending',
+    ])
+    log.add('approval/decided', { id: 'ap1', outcome: 'allowed-once' })
+    log.result(1, 1, 'w', '')
+    const tool = nodeOf(replay(log.events).snapshot, 'tool')
+    expect(tool.data.approvals).toEqual([
+      {
+        id: 'ap1',
+        toolName: 'bash',
+        reason: 'escalate sandbox',
+        outcome: 'allowed-once',
+      },
+    ])
+  })
+
+  it('builds workflow runs inside the tool row or standalone', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.call(1, 1, 'wf', 'workflow', { script: 'x' })
+    log.add('tool-workflow/run-start', {
+      runId: 'run-1',
+      name: 'review',
+      tool: 'workflow',
+      callId: 'wf',
+    })
+    log.add('tool-workflow/phase', { runId: 'run-1', title: 'Explore' })
+    log.add('tool-workflow/agent-start', {
+      runId: 'run-1',
+      seq: 1,
+      label: 'scout',
+      childId: 'sub-a',
+    })
+    log.add('tool-workflow/log', { runId: 'run-1', message: 'found 3 files' })
+    log.add('tool-workflow/phase', { runId: 'run-1', title: 'Fix' })
+    log.add('tool-workflow/agent-start', {
+      runId: 'run-1',
+      seq: 2,
+      label: 'fixer',
+      phase: 'Fix',
+      childId: 'sub-b',
+    })
+    log.add('tool-workflow/agent-end', {
+      runId: 'run-1',
+      seq: 1,
+      outcome: 'completed',
+    })
+    log.add('tool-workflow/agent-end', {
+      runId: 'run-1',
+      seq: 2,
+      outcome: 'failed',
+    })
+    log.add('tool-workflow/run-end', {
+      runId: 'run-1',
+      stopReason: 'completed',
+      agentsStarted: 2,
+      result: 'ok',
+    })
+    log.result(1, 1, 'wf', 'ok')
+    log.add('tool-workflow/run-start', { runId: 'run-2', name: 'nightly' })
+    const { snapshot } = replay(log.events)
+    expect(describeNodes(snapshot)).toEqual([
+      'tool[settled]: workflow',
+      'workflowRun[running]: nightly',
+    ])
+    expect(nodeOf(snapshot, 'tool').data.workflow).toEqual({
+      runId: 'run-1',
+      name: 'review',
+      tool: 'workflow',
+      callId: 'wf',
+      status: 'completed',
+      agentsStarted: 2,
+      result: 'ok',
+      logs: ['found 3 files'],
+      phases: [
+        {
+          title: 'Explore',
+          members: [
+            { seq: 1, label: 'scout', childId: 'sub-a', outcome: 'completed' },
+          ],
+        },
+        {
+          title: 'Fix',
+          members: [
+            { seq: 2, label: 'fixer', childId: 'sub-b', outcome: 'failed' },
+          ],
+        },
+      ],
+    })
+    expectConverges(log)
+  })
+})
+
+describe('messages and notices', () => {
+  it('classifies steering, hides uiHidden messages, and shows context', () => {
+    const log = new LogBuilder()
+    log.add('host/user-meta', { messageId: 'u1', displayContent: 'shown text' })
+    log.add('turn/start', { turn: 1 })
+    log.user('u1', 'model text')
+    log.add('instructions/baseline', { digest: 'x', files: ['AGENTS.md'] })
+    log.add('memory/baseline', { digest: 'y' })
+    log.add(
+      'user/message',
+      {
+        id: 'ctx1',
+        role: 'user',
+        content: [{ type: 'text', text: 'snapshot' }],
+        source: {
+          kind: 'context',
+          producer: 'runtime-context',
+          form: 'snapshot',
+        },
+      },
+      { surfaceOp: 'append' },
+    )
+    log.add('step/start', { turn: 1, step: 1 })
+    log.add('agent/inbox/spliced', {
+      target: 'next-step',
+      start: 0,
+      inserted: [
+        { id: 'u2', role: 'user', content: [], source: { kind: 'user' } },
+      ],
+    })
+    log.add('agent/inbox/spliced', {
+      target: 'next-step',
+      start: 0,
+      removedCount: 1,
+      inserted: [],
+    })
+    log.user('u2', 'also this')
+    log.add('host/user-meta', { messageId: 'u3', uiHidden: true })
+    log.user('u3', 'secret nudge')
+    const { snapshot } = replay(log.events)
+    expect(describeNodes(snapshot)).toEqual([
+      'user: shown text',
+      'context: instructions AGENTS.md',
+      'context: runtime-context',
+      'user(steering): also this',
+    ])
+    const hidden = [...snapshot.nodes.values()].find(
+      (node) => node.kind === 'user' && node.data.messageId === 'u3',
+    )
+    expect(hidden?.visibility).toBe('hidden')
+    expectConverges(log)
+  })
+
+  it('keeps the chips of a message sent from the rich composer', () => {
+    const log = new LogBuilder()
+    const references = [
+      {
+        kind: 'skill' as const,
+        id: 'image-gen',
+        label: 'Image Gen',
+        start: 3,
+        end: 13,
+      },
+    ]
+    log.add('host/user-meta', {
+      messageId: 'u1',
+      displayContent: '请用 /image-gen 画猫',
+      references,
+    })
+    log.add('turn/start', { turn: 1 })
+    log.user('u1', '请用 /image-gen 画猫')
+    const { snapshot } = replay(log.events)
+    const user = [...snapshot.nodes.values()].find(
+      (node) => node.kind === 'user',
+    )
+    expect(user?.kind === 'user' && user.data.references).toEqual(references)
+    expectConverges(log)
+  })
+
+  it('renders turn-level notices, goal rows, hooks and facts', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('hook/invoked', {
+      turn: 1,
+      point: 'PreToolUse',
+      dialect: 'claude-code',
+      handlerId: 'h:1',
+    })
+    log.add('hook/result', {
+      turn: 1,
+      point: 'PreToolUse',
+      handlerId: 'h:1',
+      decision: 'pass',
+      durationMs: 12,
+    })
+    // A restarted process reuses the handler id; the result pairs with the
+    // latest invocation.
+    log.add('hook/invoked', {
+      turn: 1,
+      point: 'Stop',
+      dialect: 'claude-code',
+      handlerId: 'h:1',
+    })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.add('todo/write', {
+      todos: [{ content: 'a', status: 'in_progress' }],
+    })
+    log.add('llm/fallback', {
+      fallbackId: 'f1',
+      turn: 1,
+      step: 1,
+      from: 'primary',
+      to: 'backup',
+      trigger: 'rate-limit',
+      failure: { message: 'slow down', code: 'RATE_LIMIT' },
+    })
+    log.add('llm/cost-cap', {
+      turn: 1,
+      step: 1,
+      capUsdNanos: 1000,
+      spentUsdNanos: 1500,
+    })
+    log.add('goal/change', {
+      kind: 'goal/change',
+      version: 1,
+      operation: 'create',
+      goal: {
+        id: 'g1',
+        revision: 1,
+        objective: 'ship it',
+        phase: 'active',
+        maxGoalRounds: 5,
+      },
+      roundsStarted: 0,
+      createdAt: 1,
+      updatedAt: 1,
+    })
+    log.add('step/end', { turn: 1, step: 1 })
+    log.add('turn/end', {
+      turn: 1,
+      reason: {
+        kind: 'error',
+        error: { message: 'provider down', code: 'SERVER' },
+      },
+    })
+    log.add('turn/start', { turn: 2 })
+    log.add('turn/end', { turn: 2, reason: { kind: 'max-tokens' } })
+    log.add('todo/write', { todos: [{ content: 'a', status: 'completed' }] })
+    log.add('goal/change', {
+      kind: 'goal/change',
+      version: 1,
+      operation: 'clear',
+      cleared: { id: 'g1', revision: 2 },
+      clearedAt: 2,
+    })
+    const { snapshot } = replay(log.events)
+    expect(describeNodes(snapshot)).toEqual([
+      'hook[done]: PreToolUse',
+      'hook[running]: Stop',
+      'fallback: primary -> backup',
+      'costCap: turn 1',
+      'goal: create active',
+      'turnError: provider down',
+      'turnMaxTokens: turn 2',
+      'goal: clear',
+    ])
+    expect(snapshot.todos).toEqual([{ content: 'a', status: 'completed' }])
+    expect(nodeOf(snapshot, 'hook').data).toMatchObject({
+      decision: 'pass',
+      durationMs: 12,
+    })
+    expectConverges(log)
+  })
+})
+
+describe('turn footer', () => {
+  it('summarizes a turn the user ended by dismissing the plan review', () => {
+    const log = new LogBuilder()
+    log.user('u1', 'plan it')
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.message(1, 1, [{ type: 'text', text: 'Here is the plan.' }])
+    log.add('step/end', { turn: 1, step: 1 })
+    log.add('turn/end', { turn: 1, reason: { kind: 'plan-dismissed' } })
+    const { snapshot } = replay(log.events)
+    expect(describeNodes(snapshot).at(-1)).toBe('turnTail: turn 1 steps=1')
+    expectConverges(log)
+  })
+})
+
+describe('task budget (KRN-03)', () => {
+  it('shows a turn the budget stopped, and the notice the model reads', () => {
+    const log = new LogBuilder()
+    log.user('u1', 'loop')
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.message(1, 1, [{ type: 'text', text: 'working' }])
+    log.add('step/end', { turn: 1, step: 1 })
+    log.add(
+      'user/message',
+      {
+        id: 'budget-1',
+        role: 'user',
+        content: [{ type: 'text', text: 'This turn stopped before step 2.' }],
+        source: {
+          kind: 'context',
+          producer: 'task-budget',
+          form: 'notice',
+          summary: '本轮已达 1 步上限，已停止',
+        },
+      },
+      { surfaceOp: 'append' },
+    )
+    log.add('turn/end', {
+      turn: 1,
+      reason: { kind: 'budget', limit: 'steps', maxSteps: 1 },
+    })
+    log.add('turn/start', { turn: 2 })
+    log.add('turn/end', {
+      turn: 2,
+      reason: {
+        kind: 'budget',
+        limit: 'cost',
+        capUsdNanos: 1_000_000_000,
+        spentUsdNanos: 1_200_000_000,
+      },
+    })
+    const { snapshot } = replay(log.events)
+    const described = describeNodes(snapshot)
+    expect(described).toContain('context: task-budget')
+    expect(described).toContain('turnBudget: turn 1 steps')
+    expect(described.at(-1)).toBe('turnBudget: turn 2 cost')
+    // A budget stop is not a finished turn: no turn footer.
+    expect(described.some((line) => line.startsWith('turnTail'))).toBe(false)
+    expectConverges(log)
+  })
+})
+
+describe('turn files', () => {
+  const record = {
+    turn: 1,
+    mode: 'git' as const,
+    status: 'recorded' as const,
+    files: [
+      {
+        path: 'src/a.ts',
+        status: 'modified' as const,
+        additions: 2,
+        deletions: 1,
+      },
+    ],
+    totals: { files: 1, additions: 2, deletions: 1 },
+    snapshot: { before: 'b'.repeat(40), after: 'a'.repeat(40) },
+  }
+
+  function turnWithFiles(): LogBuilder {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.message(1, 1, [{ type: 'text', text: 'done' }])
+    log.add('step/end', { turn: 1, step: 1 })
+    log.add('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    // The next turn starts before the snapshot finishes.
+    log.add('turn/start', { turn: 2 })
+    log.add('turn/files', record)
+    return log
+  }
+
+  it('shows the card before the turn’s footer, even when it lands late (UI-S13)', () => {
+    const log = turnWithFiles()
+    const { snapshot } = replay(log.events)
+    const kinds = describeNodes(snapshot)
+    // The footer is the turn's last row; the record landed after turn 2
+    // began and still sits inside turn 1.
+    expect(kinds.slice(-2)).toEqual([
+      'turnFiles: turn 1 files=1',
+      'turnTail: turn 1 steps=1',
+    ])
+    const tail = nodeOf(snapshot, 'turnTail')
+    const files = nodeOf(snapshot, 'turnFiles')
+    expect(files.turn).toBe(1)
+    expect(files.anchorSeq).toBeLessThan(tail.anchorSeq)
+    // Nothing of the turn's own steps comes after the card.
+    const ordered = snapshot.order.map((key) => snapshot.nodes.get(key)!)
+    expect(ordered.at(-3)?.kind).toBe('assistant')
+    expect(nodeOf(snapshot, 'turnFiles').data).toMatchObject({
+      turn: 1,
+      mode: 'git',
+      status: 'recorded',
+      reviewable: true,
+      concurrent: false,
+      truncated: false,
+      files: record.files,
+      totals: record.totals,
+    })
+    expectConverges(log)
+  })
+
+  it('keeps the footer last when the record lands before the next turn (UI-S13)', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.message(1, 1, [{ type: 'text', text: 'done' }])
+    log.add('step/end', { turn: 1, step: 1 })
+    log.add('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    log.add('turn/files', record)
+    log.user('u2', 'next')
+    const { snapshot } = replay(log.events)
+    expect(describeNodes(snapshot).slice(-3, -1)).toEqual([
+      'turnFiles: turn 1 files=1',
+      'turnTail: turn 1 steps=1',
+    ])
+    expectConverges(log)
+  })
+
+  it('puts the card after the turn’s notice, before the next prompt (UI-S13)', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.message(1, 1, [{ type: 'text', text: 'half' }])
+    log.add('step/end', { turn: 1, step: 1 })
+    log.add('turn/end', {
+      turn: 1,
+      reason: {
+        kind: 'error',
+        error: { message: 'provider down', code: 'SERVER' },
+      },
+    })
+    log.user('u2', 'again')
+    log.add('turn/files', record)
+    const kinds = describeNodes(snapshot(log))
+    const notice = kinds.indexOf('turnError: provider down')
+    expect(kinds[notice + 1]).toBe('turnFiles: turn 1 files=1')
+    expect(kinds.at(-1)?.startsWith('user')).toBe(true)
+    expectConverges(log)
+
+    function snapshot(builder: LogBuilder) {
+      return replay(builder.events).snapshot
+    }
+  })
+
+  it('marks the card undone once the turn is reverted', () => {
+    const log = turnWithFiles()
+    log.add('turn/files-reverted', {
+      turn: 1,
+      reverted: [],
+      skipped: [{ path: 'src/a.ts', reason: 'changed-since' }],
+    })
+    const { snapshot } = replay(log.events)
+    expect(nodeOf(snapshot, 'turnFiles').data.reverted).toEqual({
+      reverted: [],
+      skipped: [{ path: 'src/a.ts', reason: 'changed-since' }],
+    })
+    expectConverges(log)
+  })
+
+  it('keeps a skipped or tools-only record without review', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('turn/end', {
+      turn: 1,
+      reason: { kind: 'aborted', reason: { kind: 'user' } },
+    })
+    log.add('turn/files', {
+      turn: 1,
+      mode: 'git',
+      status: 'skipped',
+      skipReason: 'timeout',
+      files: [],
+      totals: { files: 0, additions: 0, deletions: 0 },
+    })
+    log.add('turn/start', { turn: 2 })
+    log.add('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    log.add('turn/files', {
+      turn: 2,
+      mode: 'tools',
+      status: 'recorded',
+      files: [{ path: 'a.txt', status: 'added', additions: 1, deletions: 0 }],
+      totals: { files: 1, additions: 1, deletions: 0 },
+    })
+    const { snapshot } = replay(log.events)
+    expect(nodeOf(snapshot, 'turnFiles', 0).data).toMatchObject({
+      status: 'skipped',
+      skipReason: 'timeout',
+      reviewable: false,
+    })
+    expect(nodeOf(snapshot, 'turnFiles', 1).data).toMatchObject({
+      mode: 'tools',
+      reviewable: false,
+    })
+    // A turn that changed nothing has no card.
+    expect(
+      describeNodes(snapshot).filter((line) => line.startsWith('turnFiles')),
+    ).toHaveLength(2)
+  })
+
+  it('puts a task’s card after its last turn — the one a subagent woke — and keeps the task (UI-S15)', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.user('u1', 'have the writers start')
+    log.message(1, 1, [{ type: 'text', text: 'the writers are on it' }])
+    log.add('step/end', { turn: 1, step: 1 })
+    log.add('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    log.add('turn/start', { turn: 2 })
+    log.add('step/start', { turn: 2, step: 1 })
+    log.add(
+      'user/message',
+      {
+        id: 'n1',
+        role: 'user',
+        content: [{ type: 'text', text: 'Subagent sub-1 completed.' }],
+        source: {
+          kind: 'context',
+          producer: 'subagent',
+          form: 'notice',
+          summary: 'Subagent sub-1 completed',
+        },
+      },
+      { surfaceOp: 'append' },
+    )
+    log.message(2, 1, [{ type: 'text', text: 'all chapters are in' }])
+    log.add('step/end', { turn: 2, step: 1 })
+    log.add('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    log.add('turn/files', {
+      ...record,
+      turn: 2,
+      task: { firstTurn: 1, lastTurn: 2 },
+    })
+    const { snapshot } = replay(log.events)
+    const kinds = describeNodes(snapshot).filter(
+      (line) => !line.startsWith('context'),
+    )
+    // No card inside the task; one after its last turn, before that footer.
+    expect(kinds.filter((line) => line.startsWith('turnFiles'))).toEqual([
+      'turnFiles: turn 2 files=1',
+    ])
+    expect(kinds.slice(-2)).toEqual([
+      'turnFiles: turn 2 files=1',
+      'turnTail: turn 2 steps=1',
+    ])
+    expect(nodeOf(snapshot, 'turnFiles').data.task).toEqual({
+      firstTurn: 1,
+      lastTurn: 2,
+    })
+    expect(nodeOf(snapshot, 'turnFiles').data.recovered).toBe(false)
+    expectConverges(log)
+  })
+
+  it('carries that a task was recorded only after Cutroom came back (UI-S15)', () => {
+    const log = new LogBuilder()
+    log.add('turn/start', { turn: 1 })
+    log.add('step/start', { turn: 1, step: 1 })
+    log.message(1, 1, [{ type: 'text', text: 'half done' }])
+    log.add('step/end', { turn: 1, step: 1 })
+    log.add('turn/end', { turn: 1, reason: { kind: 'interrupted' } })
+    log.add('turn/files', {
+      ...record,
+      task: { firstTurn: 1, lastTurn: 1 },
+      recovered: true,
+    })
+    const { snapshot } = replay(log.events)
+    expect(nodeOf(snapshot, 'turnFiles').data.recovered).toBe(true)
+    expectConverges(log)
+  })
+
+  it('shows a standalone run closed by crash repair as interrupted', () => {
+    const log = new LogBuilder()
+    log.add('tool-workflow/run-start', { runId: 'run-3', name: 'nightly' })
+    log.add('tool-workflow/agent-start', {
+      runId: 'run-3',
+      seq: 1,
+      label: 'scout',
+      childId: 'sub-c',
+    })
+    log.add('tool-workflow/agent-end', {
+      runId: 'run-3',
+      seq: 1,
+      outcome: 'cancelled',
+      repaired: true,
+    })
+    log.add('tool-workflow/run-end', {
+      runId: 'run-3',
+      stopReason: 'interrupted',
+      error: 'interrupted',
+      repaired: true,
+    })
+    const { snapshot } = replay(log.events)
+    expect(describeNodes(snapshot)).toEqual([
+      'workflowRun[interrupted]: nightly',
+    ])
+    expectConverges(log)
+  })
+})

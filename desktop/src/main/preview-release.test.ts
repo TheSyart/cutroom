@@ -1,0 +1,359 @@
+import { describe, expect, it } from 'vitest'
+import * as fs from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
+import { createRequire } from 'node:module'
+import { spawnSync } from 'node:child_process'
+import { packagedSmokeFixture } from './test-fixtures/packaged-smoke'
+
+const desktopRoot = path.resolve(__dirname, '..', '..')
+const repoRoot = path.resolve(desktopRoot, '..')
+const workflowsRoot = path.join(repoRoot, '.github', 'workflows')
+const require = createRequire(import.meta.url)
+
+const signingSecretNames = [
+  'MACOS_CERTIFICATE',
+  'MACOS_CERTIFICATE_PASSWORD',
+  'APPLE_API_KEY_BASE64',
+  'APPLE_API_KEY_ID',
+  'APPLE_API_ISSUER',
+  'APPLE_TEAM_ID',
+  'WINDOWS_SIGNING_ENDPOINT',
+  'WINDOWS_SIGNING_PROFILE',
+  'WINDOWS_SIGNING_ACCOUNT',
+  'WINDOWS_SIGNING_PUBLISHER',
+  'AZURE_TENANT_ID',
+  'AZURE_CLIENT_ID',
+  'AZURE_CLIENT_SECRET',
+] as const
+
+function readWorkflow(name: string): string {
+  return fs.readFileSync(path.join(workflowsRoot, name), 'utf8')
+}
+
+function runContract(...args: string[]) {
+  return spawnSync(
+    process.execPath,
+    [path.join(repoRoot, 'scripts', 'preview-release-contract.mjs'), ...args],
+    { cwd: repoRoot, encoding: 'utf8' },
+  )
+}
+
+describe('unsigned preview release channel', () => {
+  it('routes Preview tags automatically while keeping Stable manual', () => {
+    const stable = readWorkflow('release.yml')
+    const preview = readWorkflow('release-preview.yml')
+
+    expect(stable).toContain('workflow_dispatch:')
+    expect(stable).toContain('stable_tag:')
+    expect(stable).toContain('publish:')
+    expect(stable).not.toMatch(/^\s*push:\s*$/m)
+    expect(preview).toContain("- 'v*-preview.*'")
+    expect(preview).not.toContain("- 'v*'")
+    expect(preview).not.toContain('workflow_dispatch:')
+  })
+
+  it('builds both macOS architectures without signing credentials', () => {
+    const workflow = readWorkflow('release-preview.yml')
+
+    expect(workflow).toContain('macos-15')
+    expect(workflow).toContain('macos-15-intel')
+    expect(workflow).not.toContain('windows-preview:')
+    expect(workflow).not.toContain('linux-preview-build:')
+    expect(workflow).toContain('ubuntu-24.04')
+    expect(workflow).toContain('arch: arm64')
+    expect(workflow).toContain('arch: x64')
+    // REL-04: pinned to the commit of v5, with the version beside it.
+    expect(workflow).toMatch(/actions\/setup-python@[0-9a-f]{40} # v5\./)
+    expect(workflow).toContain("python-version: '3.11'")
+    expect(workflow).toContain("CSC_IDENTITY_AUTO_DISCOVERY: 'false'")
+    expect(workflow).toContain('contents: read')
+    expect(workflow).not.toContain('forceCodeSigning')
+    expect(workflow).not.toContain('notarize')
+    expect(workflow).not.toContain('azureSignOptions')
+    for (const name of signingSecretNames) {
+      expect(workflow, name).not.toContain(name)
+    }
+  })
+
+  it('uses an isolated unsigned builder configuration for all seven files', () => {
+    const config = require(
+      path.join(desktopRoot, 'electron-builder.preview.cjs'),
+    ) as Record<string, unknown>
+
+    expect(config).toMatchObject({
+      extends: './electron-builder.yml',
+      mac: {
+        target: ['dmg', 'zip'],
+        identity: null,
+        artifactName:
+          'Cutroom-${version}-macos-${arch}-UNSIGNED-PREVIEW.${ext}',
+      },
+      win: {
+        target: ['nsis'],
+        artifactName:
+          'Cutroom-${version}-windows-${arch}-UNSIGNED-PREVIEW.${ext}',
+      },
+      linux: {
+        target: ['AppImage', 'deb'],
+        artifactName: 'Cutroom-${version}-linux-x64-UNSIGNED-PREVIEW.${ext}',
+      },
+    })
+
+    // Resources come from the yml (the browser extension among them).
+    expect(config).not.toHaveProperty('extraResources')
+    expect(config.mac).not.toHaveProperty('extraResources')
+
+    const serialized = JSON.stringify(config)
+    expect(serialized).not.toContain('forceCodeSigning')
+    expect(serialized).not.toContain('notarize')
+    expect(serialized).not.toContain('azureSignOptions')
+  })
+
+  it('keeps internal artifacts manual and excluded from Preview', () => {
+    const internal = readWorkflow('release-internal.yml')
+    const preview = readWorkflow('release-preview.yml')
+
+    expect(internal).toContain('workflow_dispatch:')
+    expect(internal).toContain('UNSIGNED-INTERNAL')
+    expect(internal).not.toContain('push:')
+    expect(preview).not.toContain('UNSIGNED-INTERNAL')
+  })
+
+  it('attests only after all candidates pass and publishes from a separate job', () => {
+    const workflow = readWorkflow('release-preview.yml')
+
+    expect(workflow).toContain('preview-aggregate:')
+    expect(workflow).toContain('preview-publish:')
+    expect(workflow).toMatch(/needs:\s*\[macos-preview\]/)
+    expect(workflow).toContain('needs: preview-aggregate')
+    expect(workflow).toContain('id-token: write')
+    expect(workflow).toContain('attestations: write')
+    expect(workflow).toContain('artifact-metadata: write')
+    expect(workflow.match(/actions\/attest@[0-9a-f]{40} # v4\./g)?.length).toBe(
+      2,
+    )
+    expect(workflow).toContain('@cyclonedx/cyclonedx-npm@6.0.0')
+    expect(workflow).toContain('assemble-preview-release-bundle.mjs')
+    expect(workflow).toContain('publish-preview-release.sh')
+    expect(workflow).toContain('gh attestation verify')
+  })
+
+  it('limits write permission to the Preview publish job', () => {
+    const workflow = readWorkflow('release-preview.yml')
+    const writeMatches = workflow.match(/contents: write/g) ?? []
+
+    expect(writeMatches).toHaveLength(1)
+    expect(workflow).toContain('UNSIGNED-PREVIEW-release-bundle')
+    expect(workflow).not.toContain('softprops/action-gh-release')
+  })
+
+  it('uses draft-first atomic Pre-release publication with rollback', () => {
+    const publisher = fs.readFileSync(
+      path.join(repoRoot, 'scripts', 'publish-preview-release.sh'),
+      'utf8',
+    )
+
+    expect(publisher).toContain('preview-publication-contract.mjs')
+    expect(publisher).toContain('merge-base --is-ancestor')
+    expect(publisher).toContain('gh release view')
+    expect(publisher).toContain('gh release create')
+    expect(publisher).toContain('--draft')
+    expect(publisher).toContain('--prerelease')
+    expect(publisher).toContain('--notes-file')
+    expect(publisher).toContain('gh release upload')
+    expect(publisher).toContain('gh release edit')
+    expect(publisher).toContain('--draft=false')
+    expect(publisher).toContain('gh release delete')
+    expect(publisher).toContain('UNSIGNED-PREVIEW')
+  })
+
+  it('documents the public Preview channel without weakening system security', () => {
+    const readme = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8')
+    const notice = fs.readFileSync(
+      path.join(repoRoot, 'docs', 'release', 'unsigned-preview-notice.md'),
+      'utf8',
+    )
+    const previewRunbook = fs.readFileSync(
+      path.join(repoRoot, 'docs', 'release', 'preview-release-runbook.md'),
+      'utf8',
+    )
+    const stableRunbook = fs.readFileSync(
+      path.join(repoRoot, 'docs', 'release', 'stable-release-runbook.md'),
+      'utf8',
+    )
+
+    for (const document of [notice, previewRunbook]) {
+      expect(document).toContain('UNSIGNED-PREVIEW')
+      expect(document).toContain('SHA256SUMS.txt')
+      expect(document).toContain('gh attestation verify')
+      expect(document).toContain('https://support.apple.com/en-us/102445')
+      expect(document).not.toMatch(/spctl\s+--master-disable/i)
+      expect(document).not.toMatch(
+        /disable\s+(Gatekeeper|SmartScreen|Defender)/i,
+      )
+    }
+    expect(notice).toContain('{{tag}}')
+    expect(previewRunbook).toContain('v<version>-preview.<n>')
+    expect(readme).toContain('docs/release/unsigned-preview-notice.md')
+    expect(readme).toContain('docs/README.md')
+    expect(previewRunbook).toContain('stable-release-runbook.md')
+    expect(stableRunbook).toContain('> 文档状态：Active')
+    expect(stableRunbook).toContain('.github/workflows/release.yml')
+  })
+
+  it('strictly classifies Stable, Preview and unsupported tags', () => {
+    const preview = runContract('classify', 'v0.1.0-preview.1')
+    const stable = runContract('classify', 'v0.1.0')
+    const unsupported = runContract('classify', 'v0.1.0-beta.1')
+
+    expect(preview.status).toBe(0)
+    expect(preview.stdout.trim()).toBe('preview')
+    expect(stable.status).toBe(0)
+    expect(stable.stdout.trim()).toBe('stable')
+    expect(unsupported.status).toBe(0)
+    expect(unsupported.stdout.trim()).toBe('none')
+  })
+
+  it('writes a fail-closed unsigned candidate receipt with artifact hashes', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'emperor-preview-'))
+    const dist = path.join(root, 'dist')
+    const tag = 'v0.1.0-preview.1'
+    const commit = 'a'.repeat(40)
+    const runId = '123456'
+    const artifactNames = [
+      'Cutroom-0.1.0-preview.1-linux-x64-UNSIGNED-PREVIEW.AppImage',
+      'Cutroom-0.1.0-preview.1-linux-x64-UNSIGNED-PREVIEW.deb',
+    ]
+    fs.mkdirSync(path.join(dist, 'packaged-smoke'), { recursive: true })
+    for (const name of artifactNames) {
+      fs.writeFileSync(path.join(dist, name), `fixture:${name}\n`)
+    }
+    fs.writeFileSync(
+      path.join(dist, 'packaged-smoke', 'linux-x64.json'),
+      `${JSON.stringify(packagedSmokeFixture('linux', 'x64', '0.1.0-preview.1', commit))}\n`,
+    )
+
+    const result = runContract(
+      'candidate',
+      dist,
+      tag,
+      commit,
+      runId,
+      'linux',
+      'x64',
+    )
+    expect(result.status, result.stderr).toBe(0)
+
+    const receipt = JSON.parse(
+      fs.readFileSync(
+        path.join(dist, 'preview-receipts', 'candidate-linux-x64.json'),
+        'utf8',
+      ),
+    ) as Record<string, unknown>
+    expect(receipt).toMatchObject({
+      schemaVersion: 1,
+      marker: 'UNSIGNED-PREVIEW',
+      channel: 'preview',
+      signingStatus: 'unsigned',
+      tag,
+      commit,
+      runId,
+      platform: 'linux',
+      arch: 'x64',
+      resourceInspection: true,
+    })
+    expect(receipt.artifacts).toHaveLength(2)
+    expect(
+      fs.readFileSync(
+        path.join(
+          dist,
+          'preview-receipts',
+          'UNSIGNED-PREVIEW-linux-x64.marker.json',
+        ),
+        'utf8',
+      ),
+    ).toContain('UNSIGNED-PREVIEW')
+    expect(
+      fs.readFileSync(path.join(dist, 'SHA256SUMS-linux-x64.txt'), 'utf8'),
+    ).toContain('UNSIGNED-PREVIEW')
+
+    const invalidSmoke = packagedSmokeFixture(
+      'linux',
+      'x64',
+      '0.1.0-preview.1',
+      commit,
+    )
+    invalidSmoke.operations.renderer.coreBridge = false
+    fs.writeFileSync(
+      path.join(dist, 'packaged-smoke', 'linux-x64.json'),
+      JSON.stringify(invalidSmoke),
+    )
+    const refused = runContract(
+      'candidate',
+      dist,
+      tag,
+      commit,
+      runId,
+      'linux',
+      'x64',
+    )
+    expect(refused.status).toBe(1)
+    expect(refused.stderr).toContain('packaged smoke renderer')
+
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+
+  it('refuses a Stable-named macOS artifact (REL-05 naming) as Preview input', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'emperor-preview-'))
+    const dist = path.join(root, 'dist')
+    fs.mkdirSync(path.join(dist, 'packaged-smoke'), { recursive: true })
+    for (const name of [
+      'Cutroom-0.2.0-preview.1-macos-arm64-UNSIGNED-PREVIEW.dmg',
+      'Cutroom-0.2.0-preview.1-macos-arm64-UNSIGNED-PREVIEW.zip',
+      'Cutroom-0.2.0-macos-arm64.dmg',
+    ])
+      fs.writeFileSync(path.join(dist, name), `fixture:${name}\n`)
+
+    const result = runContract(
+      'candidate',
+      dist,
+      'v0.2.0-preview.1',
+      'a'.repeat(40),
+      '123456',
+      'macos',
+      'arm64',
+    )
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(
+      'non-Preview artifact input: Cutroom-0.2.0-macos-arm64.dmg',
+    )
+
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+
+  it('rejects internal markers and Stable artifact names as candidate input', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'emperor-preview-'))
+    const dist = path.join(root, 'dist')
+    fs.mkdirSync(path.join(dist, 'packaged-smoke'), { recursive: true })
+    fs.writeFileSync(path.join(dist, 'UNSIGNED-INTERNAL.txt'), 'blocked\n')
+    fs.writeFileSync(
+      path.join(dist, 'Cutroom-0.1.0-linux-x64.AppImage'),
+      'stable\n',
+    )
+
+    const result = runContract(
+      'candidate',
+      dist,
+      'v0.1.0-preview.1',
+      'a'.repeat(40),
+      '123456',
+      'linux',
+      'x64',
+    )
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toMatch(/UNSIGNED-INTERNAL|non-Preview/i)
+
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+})

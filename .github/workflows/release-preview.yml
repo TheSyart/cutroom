@@ -1,0 +1,239 @@
+name: release-preview
+
+on:
+  push:
+    tags:
+      - 'v*-preview.*'
+
+permissions:
+  contents: read
+
+env:
+  CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+jobs:
+  macos-preview:
+    name: UNSIGNED-PREVIEW macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      # Reads the nightly's last run and its failure issue (REL-04).
+      actions: read
+      issues: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+      # A red nightly blocks the release, never a pull request (REL-04).
+      - name: Require a green nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EMPEROR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: node scripts/ci/require-green-nightly.mjs
+      - name: Select Xcode with the macOS 26 SDK
+        run: scripts/ci/select-xcode.sh
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+      # node-gyp used by the node-pty Electron rebuild still imports distutils.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      - name: Validate Preview tag
+        run: node scripts/preview-release-contract.mjs assert "$GITHUB_REF_NAME" preview
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix desktop ci
+      - name: Quality gate
+        run: make check
+      - name: Apply Preview package version
+        run: npm --prefix desktop version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+      - name: Build unsigned DMG and ZIP
+        run: |
+          npm --prefix desktop run build
+          cd desktop
+          npx electron-builder --config electron-builder.preview.cjs --mac dmg zip --${{ matrix.arch }} --publish never
+      - name: Run packaged smoke and create candidate receipt
+        run: |
+          npm --prefix desktop run package:smoke
+          node scripts/preview-release-contract.mjs candidate desktop/dist "$GITHUB_REF_NAME" "$GITHUB_SHA" "$GITHUB_RUN_ID" macos "${{ matrix.arch }}"
+      - name: Upload unsigned macOS candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: UNSIGNED-PREVIEW-macos-${{ matrix.arch }}-candidate
+          path: |
+            desktop/dist/Cutroom-*-macos-${{ matrix.arch }}-UNSIGNED-PREVIEW.dmg
+            desktop/dist/Cutroom-*-macos-${{ matrix.arch }}-UNSIGNED-PREVIEW.zip
+            desktop/dist/SHA256SUMS-macos-${{ matrix.arch }}.txt
+            desktop/dist/packaged-smoke/darwin-${{ matrix.arch }}.json
+            desktop/dist/preview-receipts/candidate-macos-${{ matrix.arch }}.json
+            desktop/dist/preview-receipts/UNSIGNED-PREVIEW-macos-${{ matrix.arch }}.marker.json
+          if-no-files-found: error
+          retention-days: 7
+
+  preview-aggregate:
+    name: Verify and attest UNSIGNED-PREVIEW bundle
+    needs: [macos-preview]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+      - name: Install SBOM inputs
+        run: |
+          npm ci
+          npm --prefix desktop ci
+      - name: Download Preview candidates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: UNSIGNED-PREVIEW-*-candidate
+          path: preview-inputs
+          merge-multiple: true
+      - name: Assemble fail-closed Preview bundle
+        run: >-
+          node scripts/assemble-preview-release-bundle.mjs
+          preview-inputs preview-bundle "$GITHUB_REF_NAME" "$GITHUB_SHA"
+          "$GITHUB_RUN_ID"
+      - name: Generate reproducible CycloneDX SBOM and full checksums
+        run: |
+          mkdir -p preview-sbom
+          npx --yes @cyclonedx/cyclonedx-npm@6.0.0 \
+            --package-lock-only \
+            --output-reproducible \
+            --spec-version 1.6 \
+            --output-format JSON \
+            --validate \
+            --output-file preview-sbom/core.cdx.json
+          npx --yes @cyclonedx/cyclonedx-npm@6.0.0 \
+            --package-lock-only \
+            --ignore-npm-errors \
+            --output-reproducible \
+            --spec-version 1.6 \
+            --output-format JSON \
+            --validate \
+            --output-file preview-sbom/desktop.cdx.json \
+            desktop/package.json
+          node scripts/merge-cyclonedx-sboms.mjs \
+            preview-sbom/core.cdx.json \
+            preview-sbom/desktop.cdx.json \
+            "preview-bundle/Cutroom-${GITHUB_REF_NAME}.cdx.json"
+          (
+            cd preview-bundle
+            find . -maxdepth 1 -type f \
+              ! -name 'SHA256SUMS.txt' \
+              -printf '%f\n' | LC_ALL=C sort | while IFS= read -r file; do
+                sha256sum "$file"
+              done >SHA256SUMS.txt
+            sha256sum --check SHA256SUMS.txt
+          )
+          node scripts/preview-publication-contract.mjs \
+            preview-bundle "$GITHUB_REF_NAME" "$GITHUB_SHA" "$GITHUB_RUN_ID"
+      - name: Attest Preview build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: preview-bundle/SHA256SUMS.txt
+      - name: Attest Preview artifact SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: preview-bundle/ARTIFACT-SHA256SUMS.txt
+          sbom-path: preview-bundle/Cutroom-${{ github.ref_name }}.cdx.json
+      - name: Verify Preview attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while read -r _ file; do
+            file="${file#\*}"
+            gh attestation verify "preview-bundle/$file" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-preview.yml" \
+              --source-ref "$GITHUB_REF"
+          done <preview-bundle/SHA256SUMS.txt
+          while read -r _ file; do
+            file="${file#\*}"
+            gh attestation verify "preview-bundle/$file" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-preview.yml" \
+              --source-ref "$GITHUB_REF" \
+              --predicate-type 'https://cyclonedx.org/bom'
+          done <preview-bundle/ARTIFACT-SHA256SUMS.txt
+      - name: Upload attested Preview bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: UNSIGNED-PREVIEW-release-bundle
+          path: preview-bundle
+          if-no-files-found: error
+          retention-days: 7
+
+  preview-publish:
+    name: Publish atomic UNSIGNED-PREVIEW GitHub Pre-release
+    needs: preview-aggregate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      attestations: read
+    env:
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Fetch default branch
+        run: git fetch origin "$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Download attested Preview bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: UNSIGNED-PREVIEW-release-bundle
+          path: preview-bundle
+      - name: Reverify Preview checksums and attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/preview-publication-contract.mjs \
+            preview-bundle "$GITHUB_REF_NAME" "$GITHUB_SHA" "$GITHUB_RUN_ID"
+          while read -r _ file; do
+            file="${file#\*}"
+            gh attestation verify "preview-bundle/$file" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-preview.yml" \
+              --source-ref "$GITHUB_REF"
+          done <preview-bundle/SHA256SUMS.txt
+          while read -r _ file; do
+            file="${file#\*}"
+            gh attestation verify "preview-bundle/$file" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-preview.yml" \
+              --source-ref "$GITHUB_REF" \
+              --predicate-type 'https://cyclonedx.org/bom'
+          done <preview-bundle/ARTIFACT-SHA256SUMS.txt
+      - name: Create draft, verify inventory and publish Pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/publish-preview-release.sh preview-bundle

@@ -1,0 +1,188 @@
+/* Global surfaces still shared outside scoped SFC styles: the composer
+   attachment chip + image preview lightbox (AttachmentChip.vue). The
+   retired settings views / panels and the first-run dialog no longer have
+   rules here: settings sections and the first-run guide style themselves
+   (scoped). */
+
+/* ─── 附件 chip：草稿条 + 用户气泡通用 ─── */
+
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 16rem;
+  padding: var(--space-1-5) var(--space-2);
+  border-width: 1px;
+  border-radius: var(--r-sm);
+  border-color: rgb(var(--stroke-solid));
+  background: rgb(var(--surface-base));
+  box-shadow: none;
+}
+.attach-chip.is-image .attach-thumb {
+  flex-shrink: 0;
+  width: 3rem;
+  height: 3rem;
+  border-radius: var(--r-sm);
+  object-fit: cover;
+}
+.attach-preview-trigger {
+  display: block;
+  flex-shrink: 0;
+  border-radius: var(--r-sm);
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  transition:
+    transform var(--duration) var(--ease-standard),
+    box-shadow var(--duration) var(--ease-standard);
+}
+.attach-preview-trigger:hover {
+  transform: scale(1.03);
+}
+.attach-preview-trigger:focus-visible {
+  box-shadow: 0 0 0 2px rgb(var(--accent) / 0.62);
+}
+.attach-chip .attach-doc-icon {
+  display: grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 3rem;
+  height: 3rem;
+  border-width: 1px;
+  border-radius: var(--r-sm);
+  border-color: rgb(var(--stroke-solid) / 0.45);
+  background-color: rgb(var(--surface-sunken));
+}
+.attach-chip .attach-doc-icon img {
+  width: 2.25rem;
+  height: 2.25rem;
+  transform: scale(1.08);
+}
+.attach-chip.uploading {
+  border-color: rgb(var(--warn) / 0.4);
+  background-color: rgb(var(--warn) / 0.1);
+}
+.attach-chip .attach-meta {
+  flex: 1 1 0%;
+  min-width: 0;
+  line-height: 1.25;
+}
+.attach-chip .attach-name {
+  overflow: hidden;
+  color: rgb(var(--text-1));
+  font-family: var(--font-mono);
+  font-size: var(--fs-xxs);
+  font-weight: var(--weight-semibold);
+  line-height: 1rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attach-chip .attach-sub {
+  overflow: hidden;
+  color: rgb(var(--text-2));
+  font-family: var(--font-mono);
+  font-size: var(--fs-xxxs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attach-chip .attach-remove {
+  display: grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: var(--space-6);
+  height: var(--space-6);
+  margin-left: var(--space-1);
+  border-radius: var(--r-full);
+  background-color: rgb(var(--surface-sunken));
+  color: rgb(var(--text-2));
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+  transition:
+    background-color var(--duration) var(--ease-standard),
+    color var(--duration) var(--ease-standard);
+}
+.attach-chip .attach-remove:hover {
+  background-color: rgb(var(--accent) / 0.15);
+  color: rgb(var(--accent));
+}
+
+/* 用户消息气泡上方的 attach 行 */
+.attachment-preview-modal {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-lightbox);
+  display: grid;
+  place-items: center;
+  padding: var(--space-6);
+  background: rgb(var(--shadow-color) / 0.78);
+  backdrop-filter: blur(var(--backdrop-blur));
+}
+
+.attachment-preview-stage {
+  position: relative;
+  display: flex;
+  max-height: calc(100vh - 48px);
+  max-width: min(94vw, 1440px);
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid rgb(var(--stroke-solid-strong));
+  border-radius: var(--r-xl);
+  background: rgb(var(--surface-base));
+  box-shadow: 0 28px 90px rgb(var(--shadow-color) / 0.5);
+}
+
+.attachment-preview-stage > img {
+  min-height: 0;
+  max-height: calc(100vh - 118px);
+  max-width: min(94vw, 1440px);
+  object-fit: contain;
+  background: rgb(var(--surface-sunken));
+}
+
+.attachment-preview-close {
+  position: absolute;
+  top: var(--space-3);
+  right: var(--space-3);
+  z-index: var(--z-base);
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 1px solid rgb(var(--stroke-solid-strong));
+  border-radius: 999px;
+  background: rgb(var(--surface-base) / 0.9);
+  color: rgb(var(--text-1));
+  font-size: 22px;
+  line-height: 1;
+  box-shadow: 0 6px 20px rgb(var(--shadow-color) / 0.24);
+}
+
+.attachment-preview-close:hover,
+.attachment-preview-close:focus-visible {
+  border-color: rgb(var(--accent));
+  outline: none;
+  color: rgb(var(--accent));
+}
+
+.attachment-preview-caption {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 11px var(--space-3);
+  color: rgb(var(--text-1));
+}
+
+.attachment-preview-caption strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-preview-caption span {
+  flex-shrink: 0;
+  color: rgb(var(--text-2));
+  font-family: var(--font-mono);
+  font-size: var(--fs-xxxs);
+}

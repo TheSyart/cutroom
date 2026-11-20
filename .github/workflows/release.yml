@@ -1,0 +1,284 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      stable_tag:
+        description: Existing annotated Stable tag to rehearse or publish
+        required: true
+        type: string
+      publish:
+        description: Publish after all candidates, receipts and attestations pass
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: stable-release-${{ inputs.stable_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# Stable is unsigned, like Preview (decided 2026-10-01; REL-05): no
+# certificate, no notarization, no secret. electron-builder.release.cjs has
+# no identity and after-pack seals every piece of code ad hoc with the
+# hardened runtime; signing discovery stays off for every step.
+env:
+  CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+jobs:
+  release-policy:
+    name: Validate explicit Stable release request
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # Reads the nightly's last run and its failure issue (REL-04).
+      actions: read
+      issues: read
+    outputs:
+      tag: ${{ steps.policy.outputs.tag }}
+      commit: ${{ steps.policy.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+      # A red nightly blocks the release, never a pull request (REL-04).
+      - name: Require a green nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EMPEROR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: node scripts/ci/require-green-nightly.mjs
+      - id: policy
+        name: Require an annotated Stable tag on the default branch
+        shell: bash
+        env:
+          STABLE_TAG: ${{ inputs.stable_tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [[ ! "$STABLE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Stable tag must be a release tag without a prerelease suffix" >&2
+            exit 1
+          fi
+          git rev-parse --verify "refs/tags/$STABLE_TAG" >/dev/null
+          if [[ "$(git cat-file -t "refs/tags/$STABLE_TAG")" != tag ]]; then
+            echo "Stable tag must be annotated: $STABLE_TAG" >&2
+            exit 1
+          fi
+          commit="$(git rev-parse "refs/tags/$STABLE_TAG^{commit}")"
+          version="$(git show "$commit:desktop/package.json" 2>/dev/null | node -e "let value=''; process.stdin.on('data', chunk => value += chunk).on('end', () => process.stdout.write(JSON.parse(value).version))")"
+          if [[ "$STABLE_TAG" != "v$version" ]]; then
+            echo "Stable tag $STABLE_TAG does not match desktop version $version" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$commit" "origin/$DEFAULT_BRANCH"
+          echo "tag=$STABLE_TAG" >>"$GITHUB_OUTPUT"
+          echo "commit=$commit" >>"$GITHUB_OUTPUT"
+
+  macos-candidate:
+    name: macOS candidate (${{ matrix.arch }})
+    needs: release-policy
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    env:
+      EMPEROR_RELEASE_TAG: ${{ needs.release-policy.outputs.tag }}
+      EMPEROR_RELEASE_COMMIT: ${{ needs.release-policy.outputs.commit }}
+      ELECTRON_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.release-policy.outputs.tag }}
+          fetch-depth: 1
+      - name: Select Xcode with the macOS 26 SDK
+        run: scripts/ci/select-xcode.sh
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+      # node-gyp used by the node-pty Electron rebuild still imports distutils.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix desktop ci
+      - name: Quality gate
+        run: make check
+      - name: Build the unsigned, ad-hoc sealed DMG and ZIP
+        run: scripts/build_desktop_release.sh
+      - name: Verify seal, fuses, DMG, ZIP and packaged smoke
+        run: scripts/verify-macos-release.sh "${{ matrix.arch }}"
+      # The packaged gate must refuse this build with its seal taken away.
+      - name: Probe that an unsealed copy is refused
+        run: node scripts/ci/gate-negative-probe.mjs --app "desktop/dist/${{ matrix.arch == 'arm64' && 'mac-arm64' || 'mac' }}/Cutroom.app"
+      - name: Upload macOS candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-${{ matrix.arch }}-candidate
+          path: |
+            desktop/dist/Cutroom-*-macos-${{ matrix.arch }}.dmg
+            desktop/dist/Cutroom-*-macos-${{ matrix.arch }}.zip
+            desktop/dist/SHA256SUMS-macos-${{ matrix.arch }}.txt
+            desktop/dist/packaged-smoke/darwin-${{ matrix.arch }}.json
+            desktop/dist/release-receipts/macos-${{ matrix.arch }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release-aggregate:
+    name: Verify and attest the unsigned Stable bundle
+    needs: [release-policy, macos-candidate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      EMPEROR_RELEASE_TAG: ${{ needs.release-policy.outputs.tag }}
+      EMPEROR_RELEASE_COMMIT: ${{ needs.release-policy.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.release-policy.outputs.tag }}
+          fetch-depth: 1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+      - name: Install SBOM inputs
+        run: |
+          npm ci
+          npm --prefix desktop ci
+      - name: Download macOS candidates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: 'macos-*-candidate'
+          path: release-inputs
+          merge-multiple: true
+      - name: Assemble the fail-closed release bundle
+        run: node scripts/assemble-release-bundle.mjs release-inputs release-bundle "$EMPEROR_RELEASE_TAG" "$EMPEROR_RELEASE_COMMIT"
+      - name: Generate the reproducible CycloneDX SBOM
+        run: scripts/generate-release-sbom.sh "release-bundle/Cutroom-$EMPEROR_RELEASE_TAG.cdx.json"
+      - name: Write SHA256SUMS.txt over the whole bundle
+        run: node scripts/release-contract.mjs checksums release-bundle
+      - name: Publication preflight
+        run: node scripts/release-contract.mjs publication release-bundle "$EMPEROR_RELEASE_TAG" "$EMPEROR_RELEASE_COMMIT"
+      - name: Attest release provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: release-bundle/SHA256SUMS.txt
+      - name: Attest artifact SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: release-bundle/ARTIFACT-SHA256SUMS.txt
+          sbom-path: release-bundle/Cutroom-${{ needs.release-policy.outputs.tag }}.cdx.json
+      - name: Verify uploaded attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while read -r _ file; do
+            file="${file#\*}"
+            for attempt in 1 2 3 4 5; do
+              if gh attestation verify "release-bundle/$file" \
+                --repo "$GITHUB_REPOSITORY" \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                --source-ref "$GITHUB_REF"; then
+                break
+              fi
+              if [[ "$attempt" == 5 ]]; then exit 1; fi
+              sleep $((attempt * 3))
+            done
+          done <release-bundle/SHA256SUMS.txt
+          while read -r _ file; do
+            file="${file#\*}"
+            for attempt in 1 2 3 4 5; do
+              if gh attestation verify "release-bundle/$file" \
+                --repo "$GITHUB_REPOSITORY" \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                --source-ref "$GITHUB_REF" \
+                --predicate-type 'https://cyclonedx.org/bom'; then
+                break
+              fi
+              if [[ "$attempt" == 5 ]]; then exit 1; fi
+              sleep $((attempt * 3))
+            done
+          done <release-bundle/ARTIFACT-SHA256SUMS.txt
+      - name: Upload attested release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: stable-release-bundle
+          path: release-bundle
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: Publish the GitHub Release (draft first)
+    needs: [release-policy, release-aggregate]
+    if: inputs.publish == true && vars.EMPEROR_STABLE_RELEASE_ENABLED == 'true'
+    environment: stable-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      attestations: read
+    env:
+      EMPEROR_RELEASE_TAG: ${{ needs.release-policy.outputs.tag }}
+      EMPEROR_RELEASE_COMMIT: ${{ needs.release-policy.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.release-policy.outputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Download attested release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: stable-release-bundle
+          path: release-bundle
+      - name: Reverify the bundle and its attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/release-contract.mjs publication release-bundle "$EMPEROR_RELEASE_TAG" "$EMPEROR_RELEASE_COMMIT"
+          while read -r _ file; do
+            file="${file#\*}"
+            gh attestation verify "release-bundle/$file" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF"
+          done <release-bundle/SHA256SUMS.txt
+          while read -r _ file; do
+            file="${file#\*}"
+            gh attestation verify "release-bundle/$file" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" \
+              --predicate-type 'https://cyclonedx.org/bom'
+          done <release-bundle/ARTIFACT-SHA256SUMS.txt
+      - name: Create the draft, check its assets, publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/publish-release.sh release-bundle

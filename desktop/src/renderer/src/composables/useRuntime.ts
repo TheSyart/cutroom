@@ -1,0 +1,1513 @@
+import { writableReferences } from '../components/composer/editor/referenceText'
+import { reactive, ref, type Ref } from 'vue'
+import { isRuntimeEventWire } from '@emperor/core/runtime-contract'
+import type {
+  AttachmentRef,
+  BootstrapPayload,
+  ChatSendPayload,
+  ControlInteraction,
+  MessageReference,
+  PendingState,
+  QueuedPromptItem,
+  RequestedSkill,
+  RuntimeEventEnvelope,
+  RuntimeStatus,
+  SessionInfo,
+  WsEvent,
+} from '../types'
+import { pendingInteractionForSession } from '../components/conversation/takeover/takeoverModel'
+import { applySchedulerEventToBootstrap } from '../runtime/handlers/scheduler'
+import { isGitOperationCompletedEvent } from '../runtime/handlers/git'
+import { sessionLogNotice } from '../runtime/handlers/sessionLog'
+import {
+  runtimeNoticeFromEvent,
+  type RuntimeNotice,
+} from '../runtime/notifications'
+import type { TaskProjection } from '../runtime/handlers/tasks'
+import {
+  CORE_BRIDGE_UNAVAILABLE_MESSAGE,
+  hasCoreBridge,
+  invokeCore,
+  onCoreEvent,
+  setViewingSession,
+} from '../api/backend'
+import { draftSessionOf, isDraftSessionId } from '../runtime/sessionDrafts'
+import { core } from '../api/http'
+import { ActionEffectStore } from '../runtime/actionEffect'
+import {
+  createPendingProjectionState,
+  executePendingEffect,
+  reducePendingProjection,
+  type PendingEffect,
+  type PendingEffectOutput,
+  type PendingProjectionAction,
+  type PendingProjectionState,
+} from '../runtime/pendingProjection'
+import {
+  createRuntimeEffectState,
+  reduceRuntimeEffects,
+  type RuntimeEffect,
+  type RuntimeEffectAction,
+  type RuntimeEffectOutput,
+  type RuntimeEffectState,
+} from '../runtime/runtimeEffects'
+import { SessionEffectExecutor } from '../runtime/sessionEffects'
+import {
+  createSessionProjectionState,
+  eventOwnerSessionId,
+  reduceSessionProjection,
+  type SessionEffect,
+  type SessionEffectOutput,
+  type SessionProjectionAction,
+  type SessionProjectionMeta,
+  type SessionProjectionState,
+} from '../runtime/sessionProjection'
+import {
+  createTaskProjectionState,
+  isTaskRuntimeEvent,
+  reduceTaskProjection,
+  type TaskProjectionState,
+} from '../runtime/taskProjection'
+import {
+  createRendererProjectionState,
+  replayRendererProjection,
+} from '../runtime/rendererProjection'
+import { RuntimeControllerManager } from '../runtime/runtimeController'
+
+/** Transient per-session run state (sidebar marks, background pending). */
+interface SessionRuntimeState {
+  running: boolean
+  attention: boolean
+  pending: PendingState
+}
+
+function nextId(prefix: string) {
+  const random =
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  return `${prefix}-${random}`
+}
+
+const SCHEDULER_DONE_PENDING_MS = 2500
+
+function defaultControlPayload(): NonNullable<BootstrapPayload['control']> {
+  return {
+    version: 3,
+    mode: 'workspace-write',
+    preset: 'workspace-write',
+    plan: false,
+    pending: null,
+  }
+}
+const PROMPT_QUEUE_FULL_MESSAGE =
+  '已有一条消息排队，请先编辑、插入或删除后再发送。'
+
+export function useRuntime(options: {
+  boot: Ref<BootstrapPayload | null>
+  refreshMemory: (shouldToast?: boolean) => Promise<void>
+  refreshCommands: () => Promise<void>
+  showToast: (message: string) => void
+  /** Sticky error toast with 「复制详情」 (App: showError); else showToast. */
+  showError?: (error: unknown) => void
+  resolveDraftSession?: (id: string) => SessionInfo | undefined
+  onSessionCreated?: (
+    event: Extract<WsEvent, { event: 'session_created' }>,
+  ) => void
+  onSessionTitleUpdated?: (
+    event: Extract<WsEvent, { event: 'session_title_updated' }>,
+  ) => void
+  onSessionControlPendingChanged?: (
+    sessionId: string,
+    interaction?: ControlInteraction | null,
+  ) => void
+  refreshSessions?: () => Promise<void>
+  /** Root-scoped topology/state invalidation, including inactive roots. */
+  onAgentTreeChanged?: (
+    event: Extract<WsEvent, { event: 'agent_tree_changed' }>,
+  ) => void
+  /**
+   * A live event worth a bell notification (scheduler run done / failed,
+   * a waiting question / approval / plan, a finished turn, a finished git
+   * operation) — of any session, not only the selected one. The caller
+   * applies the attention policy (runtime/notifications.ts).
+   */
+  onNotify?: (notice: RuntimeNotice) => void
+}) {
+  const queuedPrompts = ref<QueuedPromptItem[]>([])
+  /** Sends waiting for the host to take them, by client message id. */
+  const admissions = new Map<string, (accepted: boolean) => void>()
+  /**
+   * Drafts whose first message is on its way (FIX-13): draft id → the
+   * session Core creates for it, named by `session_created` (null: the
+   * submit failed first). A stop or another message sent meanwhile waits
+   * for it instead of reaching Core without a session.
+   */
+  const promotions = new Map<
+    string,
+    { session: Promise<string | null>; settle: (id: string | null) => void }
+  >()
+  const pendingInteractionsBySession = reactive<
+    Record<string, ControlInteraction>
+  >({})
+  const busy = ref(false)
+  const status = ref<RuntimeStatus>('connecting')
+  const sessionId = ref<string>('')
+  const pending = reactive<PendingState>({ label: '', detail: '' })
+  const taskProjection = reactive<TaskProjection>({ tasks: [] })
+  // P1-7：per-session 瞬态运行/提醒状态，不落盘。An entry is replaced only
+  // when one of its values changes (FIX-04): a streaming delta leaves every
+  // entry, and so the sidebar that reads them, untouched.
+  const sessionRuntimeStates = reactive<Record<string, SessionRuntimeState>>({})
+  /** Last session told to main as the one on screen. */
+  let viewingSession: string | null | undefined
+  let rehydrating = false
+  /** Message of the latest turn `error` event (submit-rejection dedupe). */
+  let lastTurnErrorMessage = ''
+  let bridgeUnavailableToastShown = false
+  let taskActionState = createTaskProjectionState()
+  const runtimeControllers = new RuntimeControllerManager()
+
+  const pendingStore = new ActionEffectStore<
+    PendingProjectionState,
+    PendingProjectionAction,
+    PendingEffect,
+    PendingEffectOutput
+  >({
+    initialState: createPendingProjectionState(),
+    reducer: reducePendingProjection,
+    execute: executePendingEffect,
+    taskResultAction: (result) => ({
+      type: 'pending_effect_result',
+      result,
+    }),
+    onStateChange: (state) => Object.assign(pending, state.pending),
+  })
+
+  const runtimeEffectStore = new ActionEffectStore<
+    RuntimeEffectState,
+    RuntimeEffectAction,
+    RuntimeEffect,
+    RuntimeEffectOutput
+  >({
+    initialState: createRuntimeEffectState(),
+    reducer: reduceRuntimeEffects,
+    execute: async (effect, signal) => {
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+      if (effect.type === 'refresh_commands') await options.refreshCommands()
+      else if (effect.type === 'refresh_skills')
+        await refreshSkillCatalog(effect.sessionId)
+      else await options.refreshMemory(false)
+      return { refreshed: true }
+    },
+    taskResultAction: (result) => ({
+      type: 'runtime_effect_result',
+      result,
+    }),
+  })
+
+  const sessionEffectExecutor = new SessionEffectExecutor({
+    isAvailable: hasCoreBridge,
+    subscribe: onCoreEvent,
+    // IPC already hands each listener its own structured clone.
+    onEvent: (event) => {
+      if (event && typeof event === 'object') handleCoreEvent(event)
+    },
+  })
+  const sessionStore = new ActionEffectStore<
+    SessionProjectionState,
+    SessionProjectionAction,
+    SessionEffect,
+    SessionEffectOutput,
+    SessionProjectionMeta
+  >({
+    initialState: createSessionProjectionState(),
+    reducer: reduceSessionProjection,
+    execute: (effect, signal) => sessionEffectExecutor.execute(effect, signal),
+    taskResultAction: (result) => ({
+      type: 'session_effect_result',
+      result,
+    }),
+    onStateChange: syncSessionProjection,
+  })
+  function runtimeText() {
+    if (busy.value) return '正在办差'
+    if (!hasCoreBridge()) return '桌面 IPC 不可用'
+    if (status.value === 'ready') return '桌面 IPC 在线'
+    if (status.value === 'error') return '连接异常'
+    return '连接中'
+  }
+
+  function eventTransportText() {
+    if (!hasCoreBridge()) return '桌面 IPC 不可用'
+    return `桌面 IPC：${status.value}`
+  }
+
+  function updatePending(
+    label = '',
+    detail = '',
+    tone: PendingState['tone'] = 'running',
+    autoClearMs = 0,
+  ) {
+    if (rehydrating) return
+    pendingStore.dispatch({
+      type: 'pending_set',
+      label,
+      detail,
+      tone,
+      autoClearMs,
+    })
+  }
+
+  function connectSocket() {
+    if (hasCoreBridge()) {
+      sessionStore.dispatch({ type: 'session_connect_requested' })
+      return
+    }
+    markCoreBridgeUnavailable(true)
+    return
+  }
+
+  function markCoreBridgeUnavailable(showToast = false) {
+    status.value = 'error'
+    busy.value = false
+    updatePending(
+      '无法连接 Cutroom 核心',
+      '请在 Cutroom 桌面窗口中使用；普通浏览器连不上 Cutroom 核心。',
+      'error',
+    )
+    if (showToast && !bridgeUnavailableToastShown) {
+      bridgeUnavailableToastShown = true
+      options.showToast(CORE_BRIDGE_UNAVAILABLE_MESSAGE)
+    }
+  }
+
+  /**
+   * Submit one message. `false` when it was refused here; otherwise a
+   * promise that turns `true` once the host takes it (its user message or
+   * interjection arrives, or the submit resolves) and `false` if the submit
+   * fails first. The composer restores the draft on `false`.
+   */
+  function sendMessage(
+    payload: string | ChatSendPayload,
+  ): boolean | Promise<boolean> {
+    const normalized =
+      typeof payload === 'string'
+        ? {
+            content: payload,
+            attachments: [] as AttachmentRef[],
+            requestedSkills: [],
+            displayContent: payload,
+            references: [] as MessageReference[],
+          }
+        : {
+            content: payload.content,
+            attachments: payload.attachments || [],
+            requestedSkills: payload.requestedSkills || [],
+            displayContent: payload.displayContent || payload.content,
+            references: payload.references || [],
+            delivery: payload.delivery,
+          }
+    const text = normalized.content.trim()
+    const displayText = normalized.displayContent.trim()
+    const attachments = normalized.attachments
+    if (!text && attachments.length === 0) return false
+    const delivery = busy.value ? normalized.delivery || 'queue' : undefined
+    if (
+      delivery === 'interject' &&
+      (attachments.length > 0 || normalized.requestedSkills.length > 0)
+    ) {
+      const message = '插话仅支持纯文字；附件和 Skill 请改用排队。'
+      updatePending('无法插话', message, 'error', 4000)
+      options.showToast(message)
+      return false
+    }
+    const blockedReason = modelSendBlockedReason()
+    if (blockedReason) {
+      updatePending('需要配置模型', blockedReason, 'error', 6000)
+      options.showToast(blockedReason)
+      return false
+    }
+    if (hasCoreBridge()) {
+      connectSocket()
+      return sendMessageViaCore({
+        text,
+        displayText,
+        attachments,
+        requestedSkills: normalized.requestedSkills,
+        // Offsets were taken on the text as sent; a trim elsewhere voids them.
+        references: text === normalized.content ? normalized.references : [],
+        delivery,
+      })
+    }
+    markCoreBridgeUnavailable(true)
+    return false
+  }
+
+  function modelSendBlockedReason(): string {
+    const availability = options.boot.value?.modelConfig?.availability
+    return availability?.usable === false
+      ? availability.message || '还没有可用模型，请先配置模型。'
+      : ''
+  }
+
+  /**
+   * A plain submit only marks the session busy: the user bubble itself comes
+   * from the raw session log (host appends user/message → rawTap → the
+   * 16ms session-event batch), so there is no optimistic chat message.
+   */
+  function beginLocalTurn(): { id: string } {
+    busy.value = true
+    return { id: nextId('user') }
+  }
+
+  function enqueueLocalPrompt(
+    content: string,
+    delivery: 'queue' | 'interject',
+    attachments: AttachmentRef[],
+    requestedSkills: RequestedSkill[],
+    hasCapabilityRefs: boolean,
+    references: MessageReference[] = [],
+    payload?: ChatSendPayload,
+  ): QueuedPromptItem {
+    const id = nextId('prompt')
+    const prompt: QueuedPromptItem = {
+      id,
+      turnId: '',
+      clientMessageId: id,
+      content,
+      delivery,
+      status: delivery === 'interject' ? 'interjecting' : 'queued',
+      supportsInterjection:
+        delivery === 'queue' &&
+        attachments.length === 0 &&
+        requestedSkills.length === 0,
+      createdOrder: Date.now(),
+      attachmentCount: attachments.length,
+      requestedSkillNames: requestedSkills.map((skill) => skill.name),
+      hasCapabilityRefs: hasCapabilityRefs || references.length > 0,
+      ...(references.length ? { references } : {}),
+      ...(payload ? { payload } : {}),
+    }
+    queuedPrompts.value.push(prompt)
+    return prompt
+  }
+
+  function sendMessageViaCore(
+    opts: {
+      text: string
+      displayText: string
+      attachments: AttachmentRef[]
+      requestedSkills: RequestedSkill[]
+      references: MessageReference[]
+      delivery?: 'queue' | 'interject'
+    },
+    activeSessionId = sessionId.value,
+  ): boolean | Promise<boolean> {
+    if (!activeSessionId) {
+      updatePending('尚无会话', '请先创建会话', 'running', 3000)
+      return false
+    }
+    // FIX-13: the draft's first message is creating its session; this one
+    // goes there once it exists, not into a second new session.
+    const promoting = promotions.get(activeSessionId)?.session
+    if (promoting)
+      return promoting.then((id) => (id ? sendMessageViaCore(opts, id) : false))
+    // P1-6：draft 首条提交带上 client_draft_id 与项目元数据，由 Core 创建真实 session
+    const draftPayload = isDraftSessionId(activeSessionId)
+      ? draftSubmitPayload(activeSessionId)
+      : null
+    if (draftPayload) {
+      let settle!: (id: string | null) => void
+      const session = new Promise<string | null>((done) => (settle = done))
+      promotions.set(activeSessionId, { session, settle })
+    }
+    const userMsg: { id: string } = opts.delivery
+      ? enqueueLocalPrompt(
+          opts.displayText || opts.text,
+          opts.delivery,
+          opts.attachments,
+          opts.requestedSkills,
+          opts.displayText !== opts.text,
+          opts.references,
+          {
+            content: opts.text,
+            displayContent: opts.displayText || opts.text,
+            attachments: [...opts.attachments],
+            requestedSkills: [...opts.requestedSkills],
+            ...(opts.references.length
+              ? { references: [...opts.references] }
+              : {}),
+          },
+        )
+      : beginLocalTurn()
+    status.value = 'ready'
+    const admitted = new Promise<boolean>((resolve) => {
+      admissions.set(userMsg.id, resolve)
+    })
+    void invokeCore('chat.submit', {
+      content: opts.text,
+      displayContent: opts.displayText || opts.text,
+      attachments: opts.attachments.map((item) => item.id),
+      requestedSkills: opts.requestedSkills,
+      ...(opts.references.length
+        ? { references: writableReferences(opts.references) }
+        : {}),
+      clientMessageId: userMsg.id,
+      sessionId: activeSessionId,
+      ...(opts.delivery ? { delivery: opts.delivery } : {}),
+      ...(draftPayload ?? {}),
+    })
+      .then((result) => {
+        settlePromotion(activeSessionId, result?.activeSessionId ?? null)
+        settleAdmission(userMsg.id, true)
+      })
+      .catch((err) => {
+        settlePromotion(activeSessionId, null)
+        if (opts.delivery) {
+          queuedPrompts.value = queuedPrompts.value.filter(
+            (prompt) => prompt.id !== userMsg.id,
+          )
+          // The user cancelled (or took back to edit) a prompt the queue had
+          // already taken: nothing to restore.
+          if (queuedPromptCancellationCode(err)) {
+            settleAdmission(userMsg.id, true)
+            return
+          }
+          settleAdmission(userMsg.id, false)
+          if (promptQueueFullCode(err)) {
+            options.showToast(PROMPT_QUEUE_FULL_MESSAGE)
+            void refreshQueuedPrompts(activeSessionId)
+            return
+          }
+          reportError(err)
+          return
+        }
+        // A turn that failed after its message was taken stays sent.
+        settleAdmission(userMsg.id, false)
+        handleChatSubmitError(err)
+      })
+    return admitted
+  }
+
+  function draftSubmitPayload(draftId: string): Record<string, unknown> {
+    return {
+      clientDraftId: draftId,
+      draftSession: draftSessionOf(options.resolveDraftSession?.(draftId)),
+    }
+  }
+
+  function settlePromotion(draftId: string, id: string | null): void {
+    promotions.get(draftId)?.settle(id)
+    promotions.delete(draftId)
+  }
+
+  /** The session a draft's first message is creating, once Core names it (null: none). */
+  async function draftSession(draftId: string): Promise<string | null> {
+    return (await promotions.get(draftId)?.session) ?? null
+  }
+
+  async function refreshQueuedPrompts(ownerSessionId = sessionId.value) {
+    if (
+      !hasCoreBridge() ||
+      !ownerSessionId ||
+      isDraftSessionId(ownerSessionId)
+    ) {
+      queuedPrompts.value = []
+      return
+    }
+    try {
+      const records = await invokeCore('chat.listQueuedPrompts', {
+        sessionId: ownerSessionId,
+      })
+      if (ownerSessionId !== sessionId.value) return
+      // Keep the full message this window sent, so 编辑 brings its files back.
+      const sent = new Map(
+        queuedPrompts.value.flatMap((prompt) =>
+          prompt.payload
+            ? [[prompt.clientMessageId, prompt.payload] as const]
+            : [],
+        ),
+      )
+      queuedPrompts.value = records.map((record) => ({
+        id: record.id,
+        turnId: record.turnId,
+        clientMessageId: record.clientMessageId,
+        content: record.displayContent || '',
+        delivery: record.delivery,
+        status:
+          record.state === 'failed-previous'
+            ? 'failed-previous'
+            : record.delivery === 'interject'
+              ? 'interjecting'
+              : 'queued',
+        ...(record.state === 'failed-previous' && record.reason
+          ? { holdReason: record.reason }
+          : {}),
+        supportsInterjection: record.supportsInterjection,
+        createdOrder: record.createdOrder,
+        attachmentCount: record.attachmentIds.length,
+        requestedSkillNames: record.requestedSkills.map((skill) => skill.name),
+        hasCapabilityRefs:
+          record.requestedSkills.length > 0 ||
+          (record.references?.length ?? 0) > 0 ||
+          (Boolean(record.displayContent) &&
+            record.displayContent !== record.content),
+        ...(record.references?.length ? { references: record.references } : {}),
+        ...(sent.has(record.clientMessageId)
+          ? { payload: sent.get(record.clientMessageId) }
+          : {}),
+      }))
+    } catch (error) {
+      reportError(error)
+    }
+  }
+
+  /** `send` runs a held prompt (发送); the queue is re-read, it may still wait its turn. */
+  async function manageQueuedPrompt(
+    promptId: string,
+    action: 'cancel' | 'interject' | 'send',
+  ): Promise<boolean> {
+    if (!sessionId.value || isDraftSessionId(sessionId.value)) return false
+    try {
+      const result = await invokeCore('chat.manageQueuedPrompt', {
+        sessionId: sessionId.value,
+        promptId,
+        action,
+      })
+      if (!result.ok) {
+        options.showToast(
+          result.reason === 'prompt_already_started' ||
+            result.reason === 'prompt_not_queued'
+            ? '该消息已经开始处理，无法再修改队列。'
+            : '无法更新队列消息。',
+        )
+        await refreshQueuedPrompts()
+        return false
+      }
+      if (action === 'send') {
+        await refreshQueuedPrompts()
+        return true
+      }
+      queuedPrompts.value = queuedPrompts.value.filter(
+        (prompt) => prompt.id !== promptId,
+      )
+      return true
+    } catch (error) {
+      reportError(error)
+      await refreshQueuedPrompts()
+      return false
+    }
+  }
+
+  function sendInteractionAnswer(
+    interactionId: string,
+    answers: Record<string, unknown>,
+  ) {
+    return sendControlPayload(
+      { type: 'interaction_answer', interaction_id: interactionId, answers },
+      '已回答',
+    )
+  }
+
+  function sendPlanComment(interactionId: string, comment: string) {
+    const text = comment.trim()
+    if (!text) return false
+    return sendControlPayload(
+      { type: 'plan_comment', interaction_id: interactionId, comment: text },
+      `反馈计划：${text.slice(0, 80)}`,
+    )
+  }
+
+  function approvePlan(interactionId: string) {
+    return sendControlPayload(
+      { type: 'plan_approve', interaction_id: interactionId },
+      '批准计划，开始执行',
+    )
+  }
+
+  function cancelInteraction(interactionId: string) {
+    return sendControlPayload(
+      { type: 'interaction_cancel', interaction_id: interactionId },
+      '已取消等待中的交互',
+    )
+  }
+
+  async function stopActive() {
+    updatePending('正在停止当前任务...', '', 'running')
+    try {
+      // Stop the session on screen, named (KRN-01: Core has no default). A
+      // draft is stopped in the session its first message is creating, as
+      // soon as Core names it; with nothing sent there is nothing to stop
+      // (FIX-13).
+      const target = sessionId.value
+      const draft = isDraftSessionId(target)
+      const named = draft ? await draftSession(target) : target || null
+      if (draft && !named) return handleStopResult({ cancelled: 0 })
+      const data = await core('chat.stopRuntime', { sessionId: named })
+      return handleStopResult(data)
+    } catch (err) {
+      updatePending(
+        '停止任务失败',
+        err instanceof Error ? err.message : String(err),
+        'error',
+      )
+      return false
+    }
+  }
+
+  function handleStopResult(data: Record<string, unknown>) {
+    if (data.ok === false) {
+      const error =
+        data.error && typeof data.error === 'object'
+          ? (data.error as Record<string, unknown>)
+          : null
+      throw new Error(String(error?.message || '停止任务失败'))
+    }
+    const count = Array.isArray(data.cancelled)
+      ? data.cancelled.length
+      : Math.max(0, Number(data.cancelled || 0))
+    if (!count) {
+      const staleCleared = busy.value
+      busy.value = false
+      settleSessionRuntime(sessionId.value, false)
+      updatePending('没有正在运行的任务', '', 'done')
+      options.showToast('当前没有可停止的任务')
+      return staleCleared
+    }
+    busy.value = false
+    settleSessionRuntime(sessionId.value, false)
+    updatePending('已请求停止', `已取消 ${count} 个任务`, 'done')
+    return true
+  }
+
+  /**
+   * Answers resolve the interaction the running turn is blocked on; the same
+   * turn continues on its own (no resume turn), so this works while busy.
+   */
+  function sendControlPayload(
+    payload: Record<string, unknown>,
+    userLabel: string,
+  ) {
+    if (!hasCoreBridge()) {
+      markCoreBridgeUnavailable(true)
+      return false
+    }
+    connectSocket()
+    const interactionId = String(payload.interaction_id || '')
+    let call: Promise<unknown>
+    if (payload.type === 'interaction_answer') {
+      call = invokeCore(
+        'control.answerInteraction',
+        interactionId,
+        toPlainRecord(payload.answers || {}),
+        {},
+      )
+    } else if (payload.type === 'plan_comment') {
+      call = invokeCore(
+        'control.commentPlan',
+        interactionId,
+        String(payload.comment || ''),
+        {},
+      )
+    } else if (payload.type === 'plan_approve') {
+      call = invokeCore('control.approvePlan', interactionId, {})
+    } else if (payload.type === 'interaction_cancel') {
+      call = invokeCore('control.cancelInteraction', interactionId)
+    } else {
+      handleChatError(
+        `unsupported control payload: ${String(payload.type || '')}`,
+      )
+      return false
+    }
+    updatePending(userLabel, '', 'running', 2000)
+    void call
+      .then((result) => {
+        const control =
+          result && typeof result === 'object'
+            ? (result as Record<string, unknown>).control
+            : null
+        if (control && typeof control === 'object' && options.boot.value)
+          options.boot.value.control = control as BootstrapPayload['control']
+      })
+      .catch((err) => {
+        void handleControlPayloadError(err)
+      })
+    return true
+  }
+
+  async function handleControlPayloadError(error: unknown) {
+    updatePending()
+    reportError(error)
+    await refreshControlAndSessions()
+  }
+
+  async function refreshControlAndSessions() {
+    try {
+      const control = await invokeCore(
+        'control.get',
+        isDraftSessionId(sessionId.value) ? null : sessionId.value || null,
+      )
+      if (options.boot.value)
+        options.boot.value.control =
+          control as unknown as BootstrapPayload['control']
+    } catch {
+      // Keep the original control error as the visible failure; refresh is best-effort.
+    }
+    await options.refreshSessions?.().catch(() => undefined)
+  }
+
+  function reportError(error: unknown): void {
+    if (options.showError) options.showError(error)
+    else options.showToast(displayError(error))
+  }
+
+  function displayError(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    const errorId =
+      error && typeof error === 'object' && 'errorId' in error
+        ? String((error as { errorId?: unknown }).errorId || '')
+        : ''
+    return errorId ? `${message} · ${errorId}` : message
+  }
+
+  function handleBenignTurnInterruption(error: unknown): boolean {
+    const code = interruptionCode(error)
+    if (!code) return false
+    settleSessionRuntime(sessionId.value, false)
+    status.value = hasCoreBridge() ? 'ready' : 'error'
+    busy.value = false
+    if (code === 'turn_busy')
+      updatePending('已有任务正在运行', '请等待当前回复结束', 'done')
+    else if (code === 'cancelled') updatePending('任务已停止', '', 'done')
+    else updatePending('等待你定夺', '', 'done')
+    return true
+  }
+
+  function interruptionCode(
+    error: unknown,
+  ): 'turn_paused' | 'cancelled' | 'turn_busy' | '' {
+    if (!error || typeof error !== 'object') return ''
+    const code =
+      'code' in error ? String((error as { code?: unknown }).code || '') : ''
+    if (code === 'turn_paused' || code === 'cancelled' || code === 'turn_busy')
+      return code
+    return ''
+  }
+
+  function queuedPromptCancellationCode(error: unknown): boolean {
+    if (!error || typeof error !== 'object') return false
+    return (
+      String((error as { code?: unknown }).code || '') ===
+      'session_runtime_command_cancelled'
+    )
+  }
+
+  function promptQueueFullCode(error: unknown): boolean {
+    if (!error || typeof error !== 'object') return false
+    return (
+      String((error as { code?: unknown }).code || '') === 'prompt_queue_full'
+    )
+  }
+
+  function settleAdmission(clientMessageId: string, accepted: boolean): void {
+    const resolve = admissions.get(clientMessageId)
+    if (!resolve) return
+    admissions.delete(clientMessageId)
+    resolve(accepted)
+  }
+
+  function syncSessionProjection(state: SessionProjectionState): void {
+    sessionId.value = state.activeSessionId
+    const viewing =
+      state.activeSessionId && !isDraftSessionId(state.activeSessionId)
+        ? state.activeSessionId
+        : null
+    if (viewing !== viewingSession) {
+      viewingSession = viewing
+      setViewingSession(viewing)
+    }
+    status.value = state.transport
+    // A session with a runtime controller takes the controller's state
+    // (written right below), so its projection values are not written first.
+    const controlled = runtimeControllers.states()
+    for (const [id, value] of Object.entries(state.sessions))
+      if (!(id in controlled))
+        writeSessionRuntimeState(
+          id,
+          value.running,
+          value.attention,
+          sessionRuntimeStates[id]?.pending ??
+            createPendingProjectionState().pending,
+        )
+    syncRuntimeControllerStates()
+  }
+
+  function syncRuntimeControllerStates(): void {
+    const states = runtimeControllers.states()
+    for (const [id, value] of Object.entries(states))
+      writeSessionRuntimeState(
+        id,
+        value.running,
+        value.attention,
+        value.pending,
+      )
+  }
+
+  /** Replace one session's entry, only when a value really changed. */
+  function writeSessionRuntimeState(
+    id: string,
+    running: boolean,
+    attention: boolean,
+    pending: PendingState,
+  ): void {
+    const current = sessionRuntimeStates[id]
+    if (
+      current !== undefined &&
+      current.running === running &&
+      current.attention === attention &&
+      current.pending.label === pending.label &&
+      current.pending.detail === pending.detail &&
+      current.pending.tone === pending.tone
+    )
+      return
+    sessionRuntimeStates[id] = { running, attention, pending: { ...pending } }
+  }
+
+  function settleSessionRuntime(
+    id: string | null | undefined,
+    attention: boolean,
+  ): void {
+    const owner = String(id || '').trim()
+    if (!owner) return
+    runtimeControllers.settle(owner, attention)
+    sessionStore.dispatch({
+      type: 'session_settled',
+      sessionId: owner,
+      attention,
+    })
+    syncRuntimeControllerStates()
+  }
+
+  function clearAllSessionRunning(): void {
+    runtimeControllers.clearRunning()
+    sessionStore.dispatch({ type: 'session_running_cleared' })
+    syncRuntimeControllerStates()
+  }
+
+  function clearSessionAttention(id: string): void {
+    runtimeControllers.clearAttention(id)
+    sessionStore.dispatch({
+      type: 'session_attention_cleared',
+      sessionId: id,
+    })
+    syncRuntimeControllerStates()
+  }
+
+  function syncSessionControlPendingFromEvent(data: WsEvent): void {
+    const ownerSessionId = eventOwnerSessionId(data) || sessionId.value
+    if (!ownerSessionId) return
+    if (
+      (data.event === 'ask_request' || data.event === 'plan_draft') &&
+      data.interaction
+    ) {
+      indexPendingInteraction(ownerSessionId, data.interaction)
+      setBootControlPending(data.interaction)
+      options.onSessionControlPendingChanged?.(ownerSessionId, data.interaction)
+      return
+    }
+    if (
+      data.event === 'ask_answered' ||
+      data.event === 'plan_comment_added' ||
+      data.event === 'plan_approved' ||
+      data.event === 'interaction_cancelled'
+    ) {
+      const terminalInteractionId = String(data.interaction?.id || '').trim()
+      const current = pendingInteractionsBySession[ownerSessionId]
+      if (
+        terminalInteractionId &&
+        current &&
+        current.id !== terminalInteractionId
+      )
+        return
+      delete pendingInteractionsBySession[ownerSessionId]
+      const bootPending = options.boot.value?.control?.pending
+      if (
+        !terminalInteractionId ||
+        !bootPending ||
+        bootPending.id === terminalInteractionId
+      )
+        clearBootControlPending()
+      options.onSessionControlPendingChanged?.(ownerSessionId, null)
+    }
+  }
+
+  function indexPendingInteraction(
+    ownerSessionId: string,
+    interaction: ControlInteraction | null | undefined,
+  ): void {
+    const owner = String(ownerSessionId || '').trim()
+    if (!owner) return
+    if (!interaction || interaction.status !== 'waiting') {
+      delete pendingInteractionsBySession[owner]
+      return
+    }
+    pendingInteractionsBySession[owner] = interaction
+  }
+
+  function setBootControlPending(interaction: ControlInteraction): void {
+    if (!options.boot.value) return
+    options.boot.value.control ||= defaultControlPayload()
+    options.boot.value.control.pending = interaction
+  }
+
+  function clearBootControlPending(): void {
+    if (!options.boot.value) return
+    options.boot.value.control ||= defaultControlPayload()
+    options.boot.value.control.pending = null
+  }
+
+  function toPlainRecord(value: unknown): Record<string, unknown> {
+    const plain = toPlainIpcValue(value)
+    return plain && typeof plain === 'object' && !Array.isArray(plain)
+      ? (plain as Record<string, unknown>)
+      : {}
+  }
+
+  function toPlainIpcValue(value: unknown): unknown {
+    if (value == null) return value
+    if (
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean'
+    )
+      return value
+    if (Array.isArray(value)) return value.map((item) => toPlainIpcValue(item))
+    if (typeof value === 'object') {
+      const out: Record<string, unknown> = {}
+      for (const [key, item] of Object.entries(
+        value as Record<string, unknown>,
+      )) {
+        const plain = toPlainIpcValue(item)
+        if (plain !== undefined) out[key] = plain
+      }
+      return out
+    }
+    return undefined
+  }
+
+  /**
+   * Rebuild the non-chat runtime state (session running flags, tasks,
+   * pending interaction, busy) from the bootstrap runtime replay. The chat
+   * transcript itself renders from the raw session log (conversation/*).
+   */
+  function restoreRuntimeState() {
+    sessionStore.dispatch({
+      type: 'session_bootstrap_tasks',
+      sessionIds: (options.boot.value?.runtime?.active_tasks ?? []).map(
+        (task) => String(task?.session_id ?? '').trim(),
+      ),
+    })
+    restoreFromRuntimeEvents(options.boot.value?.runtime?.events || [])
+  }
+
+  function restoreFromRuntimeEvents(events: RuntimeEventEnvelope[]) {
+    const scope = String(
+      sessionId.value || options.boot.value?.runtime?.sessionId || '',
+    )
+    // A bootstrap taken before live events already handled for this session
+    // (the turn ended during the round trip) must not bring busy back: the
+    // live state is newer (FIX-03, UI-20).
+    const liveSeq = runtimeControllers.controller(scope).state.lastSeq
+    const stale = Number(options.boot.value?.runtime?.latestSeq ?? 0) < liveSeq
+    busy.value = false
+    updatePending()
+    rehydrating = true
+    try {
+      const adaptedEvents = events as WsEvent[]
+      if (adaptedEvents.length) {
+        runtimeControllers.replay(scope, adaptedEvents)
+        syncRuntimeControllerStates()
+        const replay = replayRendererProjection(
+          createRendererProjectionState(scope),
+          adaptedEvents,
+        )
+        sessionStore.dispatch({
+          type: 'session_replay_completed',
+          state: replay.state.session,
+        })
+        syncTaskProjection(replay.state.tasks)
+        for (const event of replay.acceptedEvents)
+          applyNonChatProjection(event, 'replay')
+      }
+      const pendingInteraction = pendingInteractionForSession(
+        options.boot.value?.control || null,
+        options.resolveDraftSession?.(scope) || null,
+      )
+      if (pendingInteraction) indexPendingInteraction(scope, pendingInteraction)
+      sessionStore.dispatch({
+        type: 'session_cursor_advanced',
+        seq: Number(options.boot.value?.runtime?.latestSeq || 0),
+      })
+    } finally {
+      rehydrating = false
+    }
+    const runtime = options.boot.value?.runtime
+    const liveRunning = runtimeControllers.controller(scope).state.running
+    if (stale) {
+      busy.value = liveRunning
+      return
+    }
+    busy.value =
+      runtime?.busy === false ? false : Boolean(runtime?.busy || liveRunning)
+    if (runtime?.busy === false) clearAllSessionRunning()
+  }
+
+  /** `skill_catalog_changed`: reload the session's Skills (and invalid ones) into bootstrap. */
+  async function refreshSkillCatalog(effectSessionId: string): Promise<void> {
+    const target = effectSessionId || sessionId.value
+    const catalog = await core('skills.list', {
+      sessionId: target && !isDraftSessionId(target) ? target : null,
+    })
+    const boot = options.boot.value
+    if (!boot) return
+    boot.skills = catalog.skills
+    boot.invalidSkills = catalog.invalid
+  }
+
+  function handleCoreEvent(input: object) {
+    if (!isRuntimeEventWire(input)) {
+      handleChatError('事件通道返回了未注册的事件', { transport: true })
+      return
+    }
+    const data = input as WsEvent
+    const admittedId =
+      data.event === 'user_message'
+        ? data.client_message_id
+        : data.event === 'prompt_interjected'
+          ? data.prompt_id
+          : undefined
+    if (admittedId) settleAdmission(String(admittedId), true)
+    if (data.event === 'agent_tree_changed') options.onAgentTreeChanged?.(data)
+    if (data.event === 'session_log_state') {
+      const notice = sessionLogNotice(data)
+      if (notice) options.showToast(notice)
+      return
+    }
+
+    const sessionTransition = sessionStore.dispatch({
+      type: 'runtime_event_received',
+      origin: 'live',
+      event: data,
+    })
+    void sessionTransition
+    const controllerDecision = runtimeControllers.accept(data, 'live')
+    syncRuntimeControllerStates()
+
+    if (!controllerDecision.duplicate && !controllerDecision.stale) {
+      syncSessionControlPendingFromEvent(data)
+      notifyRuntimeEvent(data)
+    }
+    if (controllerDecision.foreign) return
+    if (!controllerDecision.accepted) return
+
+    if (
+      controllerDecision.effects.some(
+        (effect) =>
+          effect.type === 'refresh_memory' || effect.type === 'refresh_skills',
+      )
+    )
+      runtimeEffectStore.dispatch({
+        type: 'runtime_event_committed',
+        origin: 'live',
+        sessionId: eventOwnerSessionId(data) || sessionId.value,
+        event: data,
+      })
+
+    if (applyLiveTurnEffects(data)) return
+    applyNonChatProjection(data, 'live')
+  }
+
+  /** Hand a live event of any session to the bell (`onNotify`). */
+  function notifyRuntimeEvent(data: WsEvent): void {
+    if (!options.onNotify) return
+    const notice = runtimeNoticeFromEvent(
+      data,
+      eventOwnerSessionId(data) || sessionId.value,
+      Date.now(),
+    )
+    if (notice) options.onNotify(notice)
+  }
+
+  function syncTaskProjection(state: TaskProjectionState): void {
+    taskActionState = state
+    taskProjection.tasks.splice(0, taskProjection.tasks.length, ...state.tasks)
+  }
+
+  function applyNonChatProjection(
+    data: WsEvent,
+    origin: 'live' | 'replay',
+  ): void {
+    if (data.event === 'session_created') {
+      if (data.client_draft_id && data.session?.id)
+        settlePromotion(data.client_draft_id, data.session.id)
+      if (
+        data.client_draft_id &&
+        data.client_draft_id === sessionId.value &&
+        data.session?.id
+      ) {
+        runtimeControllers.promote(data.client_draft_id, data.session.id)
+        sessionStore.dispatch({
+          type: 'session_draft_materialized',
+          draftId: data.client_draft_id,
+          sessionId: data.session.id,
+        })
+      }
+      if (origin === 'live') options.onSessionCreated?.(data)
+      return
+    }
+
+    if (data.event === 'session_title_updated') {
+      if (origin === 'live') options.onSessionTitleUpdated?.(data)
+      return
+    }
+
+    if (data.event === 'prompt_queued' || data.event === 'prompt_dequeued') {
+      // The queue tray lists the host inbox; re-read it on every change.
+      if (origin === 'live')
+        void refreshQueuedPrompts(eventOwnerSessionId(data) || sessionId.value)
+      return
+    }
+
+    if (data.event === 'queue_item_state') {
+      if (origin !== 'live') return
+      const owner = eventOwnerSessionId(data) || sessionId.value
+      // A step took it (sending) or it was discarded: it leaves the tray.
+      if (data.state === 'sending' || data.state === 'discarded') {
+        if (owner === sessionId.value)
+          queuedPrompts.value = queuedPrompts.value.filter(
+            (prompt) => prompt.id !== data.prompt_id,
+          )
+        return
+      }
+      // Held (待发送) or back in line: re-read for the row and its reason.
+      void refreshQueuedPrompts(owner)
+      return
+    }
+
+    if (data.event === 'context_usage') {
+      const used = Math.max(0, Number(data.used || 0))
+      const max = Math.max(0, Number(data.max || 0))
+      if (options.boot.value) {
+        options.boot.value.context_used = used
+        if (max && options.boot.value.modelConfig?.current) {
+          options.boot.value.modelConfig.current.contextWindowTokens = max
+        }
+      }
+      return
+    }
+
+    if (data.event === 'control_mode_update') {
+      if (options.boot.value && data.control) {
+        options.boot.value.control = data.control
+        const owner = eventOwnerSessionId(data) || sessionId.value
+        const pending = data.control.pending
+        if (owner) {
+          if (pending && pending.status === 'waiting')
+            indexPendingInteraction(owner, pending)
+          else if (pendingInteractionsBySession[owner]) {
+            delete pendingInteractionsBySession[owner]
+            options.onSessionControlPendingChanged?.(owner, null)
+          }
+        }
+      }
+      return
+    }
+
+    if (data.event === 'profile_onboarding_status_changed') {
+      if (options.boot.value && data.profile_onboarding)
+        options.boot.value.profileOnboarding = data.profile_onboarding
+      return
+    }
+
+    if (data.event === 'error') {
+      updatePending()
+      lastTurnErrorMessage = data.message || ''
+      handleChatError(data.message || '未知错误', {
+        code: data.code,
+        ownerSessionId: eventOwnerSessionId(data) || sessionId.value,
+      })
+      return
+    }
+
+    if (isTaskRuntimeEvent(data)) {
+      if (origin === 'live')
+        syncTaskProjection(
+          reduceTaskProjection(taskActionState, {
+            type: 'task_event_received',
+            event: data,
+          }).state,
+        )
+      return
+    }
+
+    if (data.event.startsWith('scheduler_')) {
+      handleSchedulerEvent(data)
+      return
+    }
+
+    // Git receipts carry no view state: they only reach the bell
+    // (notifyRuntimeEvent), whichever session they belong to.
+    if (isGitOperationCompletedEvent(data)) return
+  }
+
+  /**
+   * Turn-lifecycle side effects of the selected session's live UiEvents:
+   * busy, queue tray and pending label. The transcript itself renders from
+   * the raw session log; returns true when the event was a turn event.
+   */
+  function applyLiveTurnEffects(data: WsEvent): boolean {
+    switch (data.event) {
+      case 'user_message': {
+        const promptId = data.client_message_id || ''
+        queuedPrompts.value = queuedPrompts.value.filter(
+          (prompt) =>
+            !(
+              (promptId && prompt.clientMessageId === promptId) ||
+              (data.turn_id && prompt.turnId === data.turn_id)
+            ),
+        )
+        return true
+      }
+      case 'prompt_interjected':
+        queuedPrompts.value = queuedPrompts.value.filter(
+          (prompt) =>
+            prompt.id !== data.prompt_id &&
+            prompt.clientMessageId !== data.prompt_id,
+        )
+        busy.value = true
+        return true
+      case 'turn_phase':
+        if (data.phase === 'started') busy.value = true
+        return true
+      // assistant_reset: a retried request dropped its partial reply; the
+      // transcript already discards it from the raw log (nodes/assistant.ts).
+      case 'message_delta':
+      case 'assistant_reset':
+      case 'agent_thought':
+      case 'tool_call':
+      case 'tool_run_started':
+      case 'tool_result':
+      case 'tool_run_failed':
+        return true
+      case 'assistant_done':
+        busy.value = false
+        status.value = 'ready'
+        updatePending()
+        return true
+      case 'ask_request':
+      case 'plan_draft':
+        if (data.interaction)
+          updatePending(
+            data.event === 'plan_draft' ? '计划待预览' : '等待你回答',
+            data.interaction.title || data.interaction.context || '',
+            'done',
+          )
+        return true
+      case 'ask_answered':
+      case 'plan_comment_added':
+      case 'plan_approved':
+        return true
+      case 'interaction_cancelled':
+        updatePending('已取消等待', '', 'done')
+        return true
+      case 'runtime_task_cancelled':
+        busy.value = false
+        updatePending('任务已停止', data.reason || '', 'done')
+        return true
+      case 'hook_run_started':
+        updatePending(
+          `Hook: ${data.event_name || data.hook_id || 'running'}`,
+          data.hook_id || '',
+        )
+        return true
+      default:
+        return false
+    }
+  }
+
+  function handleSchedulerEvent(data: WsEvent) {
+    updateSchedulerBootstrap(data)
+    if (data.event === 'scheduler_run_start') {
+      updatePending('定时任务正在运行', data.job?.name || data.job?.id || '')
+      return
+    }
+    if (data.event === 'scheduler_run_done') {
+      updatePending(
+        '定时任务已完成',
+        data.job?.name || data.job?.id || '',
+        'done',
+        SCHEDULER_DONE_PENDING_MS,
+      )
+      return
+    }
+    if (data.event === 'scheduler_run_error') {
+      updatePending(
+        '定时任务失败',
+        data.error || data.job?.state?.lastError || '',
+        'error',
+      )
+      return
+    }
+    if (data.event === 'scheduler_run_cancelled') {
+      updatePending(
+        '定时任务已停止',
+        data.job?.name || data.job?.id || data.reason || '',
+        'done',
+        SCHEDULER_DONE_PENDING_MS,
+      )
+      return
+    }
+    if (data.event === 'scheduler_run_skipped') {
+      updatePending(
+        '定时任务已跳过',
+        data.job?.name || data.job?.id || data.reason || '',
+        'done',
+        SCHEDULER_DONE_PENDING_MS,
+      )
+      return
+    }
+    if (data.event === 'scheduler_run_interrupted') {
+      updatePending(
+        '定时任务已中断',
+        data.job?.name || data.job?.id || data.reason || '',
+        'done',
+        SCHEDULER_DONE_PENDING_MS,
+      )
+      return
+    }
+  }
+
+  function updateSchedulerBootstrap(data: WsEvent) {
+    const boot = options.boot.value
+    if (!boot) return
+    applySchedulerEventToBootstrap(boot, data)
+  }
+
+  /**
+   * A turn failed or the transport broke: settle busy. Turn errors render as
+   * rows from the raw session log; a rejected submit (no turn yet) or a
+   * transport failure has no row, so it surfaces as a toast.
+   */
+  function handleChatError(
+    message: string,
+    opts: {
+      code?: string
+      ownerSessionId?: string
+      transport?: boolean
+      toast?: boolean
+    } = {},
+  ) {
+    busy.value = false
+    status.value = opts.transport
+      ? 'error'
+      : hasCoreBridge()
+        ? 'ready'
+        : 'error'
+    settleSessionRuntime(opts.ownerSessionId || sessionId.value, false)
+    if (opts.transport || opts.toast) options.showToast(`出错了：${message}`)
+  }
+
+  function handleChatSubmitError(error: unknown) {
+    if (handleBenignTurnInterruption(error)) return
+    const info = runtimeErrorInfo(error)
+    const message = info.message
+    if (isRuntimeCancellationError(message)) {
+      busy.value = false
+      status.value = hasCoreBridge() ? 'ready' : 'error'
+      settleSessionRuntime(sessionId.value, false)
+      updatePending('已停止当前任务', '', 'done', 2000)
+      return
+    }
+    // The turn already failed on the log (its error row shows it): do not
+    // repeat the same failure as a toast when the submit then rejects.
+    const alreadyShown = Boolean(message) && message === lastTurnErrorMessage
+    lastTurnErrorMessage = ''
+    handleChatError(message, {
+      code: info.code,
+      ownerSessionId: sessionId.value,
+      toast: !alreadyShown,
+    })
+  }
+
+  function runtimeErrorInfo(error: unknown): {
+    message: string
+    code?: string
+    action?: string
+  } {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!error || typeof error !== 'object') return { message }
+    const record = error as { code?: unknown; action?: unknown }
+    return {
+      message,
+      code: typeof record.code === 'string' ? record.code : undefined,
+      action: typeof record.action === 'string' ? record.action : undefined,
+    }
+  }
+
+  function isRuntimeCancellationError(message: string) {
+    const text = message.toLowerCase()
+    return (
+      text.includes('active task cancelled') ||
+      text.includes('command cancelled') ||
+      text.includes('aborterror')
+    )
+  }
+
+  return {
+    queuedPrompts,
+    pendingInteractionsBySession,
+    busy,
+    status,
+    sessionId,
+    pending,
+    taskProjection,
+    sessionRuntimeStates,
+    clearSessionAttention,
+    dispose() {
+      pendingStore.dispose()
+      runtimeEffectStore.dispose()
+      sessionStore.dispose()
+      sessionEffectExecutor.close()
+    },
+    runtimeText,
+    eventTransportText,
+    switchSession(id: string) {
+      const selectedController = runtimeControllers.select(id)
+      queuedPrompts.value = []
+      busy.value = false
+      syncTaskProjection(createTaskProjectionState())
+      updatePending()
+      Object.assign(pending, selectedController.state.pending)
+      if (hasCoreBridge())
+        sessionStore.dispatch({ type: 'session_switched', sessionId: id })
+      else {
+        sessionStore.dispatch({ type: 'session_switched', sessionId: id })
+        markCoreBridgeUnavailable(true)
+      }
+      syncRuntimeControllerStates()
+      void refreshQueuedPrompts(id)
+    },
+    connectSocket,
+    sendMessage,
+    refreshQueuedPrompts,
+    manageQueuedPrompt,
+    sendInteractionAnswer,
+    sendPlanComment,
+    approvePlan,
+    cancelInteraction,
+    stopActive,
+    draftSession,
+    restoreRuntimeState,
+  }
+}

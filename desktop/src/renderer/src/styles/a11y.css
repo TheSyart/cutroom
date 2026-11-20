@@ -1,0 +1,70 @@
+/* ── Centralized accessibility adaptation ───────────────────────────────────
+   三种独立偏好信号集中在此处理,组件自身零 a11y 代码:
+   - prefers-reduced-motion    → 动效塌缩为 1ms(弹簧在 JS 侧另行直达)
+   - prefers-reduced-transparency → 背板实体化:去掉 blur、看图底色不透明
+   - prefers-contrast: more     → 边框/底色增强对比
+   在 surface 样式之前导入(见 main.ts),媒体查询只负责覆盖 token。 */
+
+@media (prefers-reduced-motion: reduce) {
+  /* 必须与主题表同特异性(:root[data-theme]),否则主题的 :root[data-theme]
+     声明会按特异性胜出,覆盖失效——Playwright a11y 断言强制这一点。 */
+  :root,
+  :root[data-theme='dark'],
+  :root[data-theme='light'] {
+    --duration-instant: 1ms;
+    --duration-fast: 1ms;
+    --duration: 1ms;
+    --duration-slow: 1ms;
+    --motion-fast: 1ms;
+    --motion-base: 1ms;
+    --motion-slow: 1ms;
+  }
+  /* dsh 连续动效(styles/dsh/animations.css):扫光直接移除;shimmer 退回
+     静态实色文字(Dot 的运行脉冲由下方的全局动画塌缩停住)。html:root
+     前缀用于压过组件 scoped 选择器的特异性(无需强制优先级标记)。 */
+  html:root .ds-glare::after {
+    content: none;
+  }
+  html:root .ds-shimmer {
+    background: none;
+    color: rgb(var(--accent));
+    -webkit-text-fill-color: currentColor;
+  }
+  html:root .ds-shimmer[data-tone='neutral'] {
+    color: rgb(var(--text-2));
+  }
+  *,
+  *::before,
+  *::after {
+    /* audit-allow: important —— 全局无障碍覆盖,须压过局部声明。 */
+    animation-duration: 1ms !important;
+    /* audit-allow: important */
+    animation-iteration-count: 1 !important;
+    /* audit-allow: important */
+    transition-duration: 1ms !important;
+    /* audit-allow: important */
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  :root,
+  :root[data-theme='dark'],
+  :root[data-theme='light'] {
+    --backdrop-blur: 0px;
+    --backdrop-blur-strong: 0px;
+    --image-viewer-veil: 0.98;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root,
+  :root[data-theme='dark'] {
+    --stroke-solid: 88 88 98;
+    --stroke-solid-strong: 140 140 150;
+  }
+  :root[data-theme='light'] {
+    --stroke-solid: 150 150 158;
+    --stroke-solid-strong: 120 120 128;
+  }
+}

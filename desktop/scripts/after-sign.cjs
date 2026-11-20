@@ -1,0 +1,108 @@
+const { spawnSync } = require('node:child_process')
+const { join } = require('node:path')
+
+// Absolute paths (SEC-04): PATH never picks the tool that checks a seal.
+const CODESIGN = '/usr/bin/codesign'
+const LIPO = '/usr/bin/lipo'
+
+const EXPECTED_LABELS = ['app', 'Electron Framework', 'Dictation Helper']
+
+function checked(command, args) {
+  const result = spawnSync(command, args, { encoding: 'utf8' })
+  if (result.error || result.status !== 0)
+    throw new Error(
+      `${command} failed for ${args.at(-1)}: ${String(result.error || result.stderr || result.stdout).trim()}`,
+    )
+  return `${result.stdout || ''}\n${result.stderr || ''}`
+}
+
+function signatureEntry(label, signedPath, executablePath) {
+  const detail = checked(CODESIGN, ['-dv', '--verbose=4', signedPath])
+  const executable = executablePath ?? /^Executable=(.+)$/m.exec(detail)?.[1]
+  if (!executable)
+    throw new Error(`${label} has no executable in its code signature`)
+  const architectures = checked(LIPO, ['-archs', executable])
+    .trim()
+    .split(/\s+/)
+  return {
+    label,
+    architectures,
+    teamId: /^TeamIdentifier=(.+)$/m.exec(detail)?.[1] || null,
+    authority: /^Authority=(.+)$/m.exec(detail)?.[1] || null,
+    adHoc: /^Signature=adhoc$/m.test(detail),
+  }
+}
+
+function validateMacSignatureEntries(entries, arch) {
+  if (
+    entries.length !== EXPECTED_LABELS.length ||
+    entries.some((entry, index) => entry.label !== EXPECTED_LABELS[index])
+  )
+    throw new Error('Cutroom signature inventory is incomplete')
+  const binaryArch = arch === 'x64' ? 'x86_64' : arch
+  for (const entry of entries)
+    if (!entry.architectures.includes(binaryArch))
+      throw new Error(`${entry.label} has the wrong architecture for ${arch}`)
+
+  const first = entries[0]
+  for (const entry of entries) {
+    if (entry.adHoc !== first.adHoc)
+      throw new Error(`${entry.label} has a different signing identity`)
+    if (first.adHoc) {
+      if (entry.authority || (entry.teamId && entry.teamId !== 'not set'))
+        throw new Error(`${entry.label} has a different signing identity`)
+    } else if (
+      !first.authority ||
+      !first.teamId ||
+      first.teamId === 'not set' ||
+      entry.authority !== first.authority ||
+      entry.teamId !== first.teamId
+    )
+      throw new Error(`${entry.label} has a different signing identity`)
+  }
+}
+
+function validateMacPackage(app, arch) {
+  checked(CODESIGN, ['--verify', '--deep', '--strict', app])
+  const contents = join(app, 'Contents')
+  const framework = join(contents, 'Frameworks', 'Electron Framework.framework')
+  const dictation = join(
+    contents,
+    'Library',
+    'Helpers',
+    'Emperor Dictation Helper.app',
+  )
+  const entries = [
+    signatureEntry('app', app),
+    signatureEntry(
+      'Electron Framework',
+      framework,
+      join(framework, 'Versions', 'A', 'Electron Framework'),
+    ),
+    signatureEntry(
+      'Dictation Helper',
+      dictation,
+      join(dictation, 'Contents', 'MacOS', 'emperor-dictation-helper'),
+    ),
+  ]
+  validateMacSignatureEntries(entries, arch)
+  return entries
+}
+
+function electronBuilderArch(value) {
+  if (typeof value === 'string' && value) return value
+  return { 0: 'ia32', 1: 'x64', 2: 'armv7l', 3: 'arm64' }[value] || process.arch
+}
+
+async function afterSign(context) {
+  if (context.electronPlatformName !== 'darwin') return
+  const app = join(
+    context.appOutDir,
+    `${context.packager.appInfo.productFilename}.app`,
+  )
+  validateMacPackage(app, electronBuilderArch(context.arch))
+}
+
+module.exports = afterSign
+module.exports.validateMacPackage = validateMacPackage
+module.exports.validateMacSignatureEntries = validateMacSignatureEntries

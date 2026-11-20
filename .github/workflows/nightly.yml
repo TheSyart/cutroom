@@ -1,0 +1,113 @@
+name: nightly
+
+# REL-04 (MAIN-29): the long suites, every night on macOS
+# (scripts/ci/nightly.mjs --list shows the steps; docs/development/ci.md).
+# A failure opens or updates an issue labelled nightly-failure and
+# release-blocker. It never blocks a pull request; release-preview.yml and
+# release.yml refuse to build while the last nightly is red or such an issue
+# is open (scripts/ci/require-green-nightly.mjs). A full green run closes it.
+
+on:
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      only:
+        description: Comma-separated step ids to run (a partial run never closes the failure issue)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+jobs:
+  macos-nightly:
+    name: macOS nightly
+    # Pixel baselines use the macOS 26 system fonts. Compatibility builds
+    # remain on macOS 15 in ci.yml and both release workflows.
+    runs-on: macos-26
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+      - name: Select Xcode with the macOS 26 SDK
+        run: scripts/ci/select-xcode.sh
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix desktop ci
+      - name: Install the Playwright browser
+        run: npm --prefix desktop exec -- playwright install chromium
+      - name: Install FFmpeg and ffprobe for editing acceptance
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            brew install ffmpeg
+          fi
+          ffmpeg -version
+          ffprobe -version
+      - name: Record OS runtime enforcement controls
+        run: node scripts/ci/macos-runtime-context.mjs >runtime-context.json
+      - name: Set the visual fixture locale and record font provenance
+        run: |
+          swift scripts/ci/macos-font-context.swift >font-context-before.json
+          defaults write NSGlobalDomain AppleLanguages -array zh-Hans en
+          swift scripts/ci/macos-font-context.swift >font-context.json
+      - name: Upload runtime context
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-context-nightly
+          path: |
+            runtime-context.json
+            font-context-before.json
+            font-context.json
+          retention-days: 7
+      - name: Nightly suites
+        env:
+          NIGHTLY_ONLY: ${{ inputs.only }}
+          # A shared runner cannot promise 60 Hz frames: the @perf frame
+          # budgets are measured and reported, not enforced (FIX-17).
+          EMPEROR_PERF_BUDGETS: report
+        run: node scripts/ci/nightly.mjs --report nightly-report ${NIGHTLY_ONLY:+--only "$NIGHTLY_ONLY"}
+      - name: Upload the nightly report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-report
+          path: nightly-report
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload visual failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-visual-debug
+          path: |
+            desktop/test-results/
+            desktop/test-results-visual/
+            desktop/out-e2e/**/*.png
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Open, update or close the nightly failure issue
+        if: always() && inputs.only == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci/open-failure-issue.mjs --report nightly-report
