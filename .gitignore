@@ -110,3 +110,9 @@ desktop/playwright.local.config.ts
 *.key
 *.mobileprovision
 *.dmg
+
+# Reports generated and uploaded by macOS CI
+/runtime-context.json
+/font-context-before.json
+/font-context.json
+/nightly-report/
