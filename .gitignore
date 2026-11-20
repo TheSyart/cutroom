@@ -116,3 +116,9 @@ desktop/playwright.local.config.ts
 /font-context-before.json
 /font-context.json
 /nightly-report/
+
+# Synthetic legacy configuration used by the Python migration test
+!/packages/core/fixtures/python-runtime/model_config.json
+!/packages/core/fixtures/python-runtime/mcp_config.json
+!/packages/core/fixtures/python-runtime/memory/MEMORY.local.md
+!/packages/core/fixtures/python-runtime/templates/USER.local.md
