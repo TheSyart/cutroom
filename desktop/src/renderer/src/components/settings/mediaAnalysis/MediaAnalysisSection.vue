@@ -216,7 +216,7 @@ onMounted(() => refreshCache())
       <Notice v-if="missing.length" tone="warn">
         缺少 {{ missing.join('、') }}。
         <template v-if="!status?.ffmpegPath">
-          请安装 <code>ffmpeg</code>。
+          请安装 <code>ffmpeg-full</code>，以支持带字幕导出。
         </template>
         <template v-if="!cloud && !status?.whisperPath">
           请安装 <code>whisper-cpp</code>。

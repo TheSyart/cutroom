@@ -121,6 +121,8 @@ jobs:
         run: |
           npm ci
           npm --prefix desktop ci
+      - name: Prepare FFmpeg for editing tests
+        run: scripts/ci/ensure-editing-ffmpeg.sh
       - name: Quality gate
         run: make check
       - name: Build the unsigned, ad-hoc sealed DMG and ZIP

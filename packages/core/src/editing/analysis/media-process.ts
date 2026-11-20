@@ -3,6 +3,23 @@ import { EmperorError } from '../../errors'
 import { dirname, join } from 'node:path'
 import { findExecutable } from './paths'
 
+// Keep the graph in a file: a long timeline can exceed the OS argument limit.
+export async function withFilterGraphFile<T>(
+  invoke: (option: '-/filter_complex' | '-filter_complex_script') => Promise<T>,
+): Promise<T> {
+  try {
+    return await invoke('-/filter_complex')
+  } catch (cause) {
+    // Older FFmpeg builds reject file-valued options before processing any frames.
+    if (
+      !(cause instanceof Error) ||
+      !cause.message.includes("Unrecognized option '/filter_complex'")
+    )
+      throw cause
+    return invoke('-filter_complex_script')
+  }
+}
+
 export function checkMediaCancelled(signal?: AbortSignal): void {
   if (signal?.aborted)
     throw new EmperorError('媒体检查已取消。', 'analysis_cancelled')
@@ -79,7 +96,8 @@ export async function runMedia(
       else if (code !== 0)
         reject(
           new EmperorError(
-            diagnostic.trim().split(/\r?\n/).at(-1) || '媒体检查失败。',
+            diagnostic.trim().split(/\r?\n/).slice(-3).join('\n') ||
+              '媒体检查失败。',
             'media_check_failed',
           ),
         )

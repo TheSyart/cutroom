@@ -47,12 +47,7 @@ jobs:
           npm ci
           npm --prefix desktop ci
       - name: Install FFmpeg for Electron export acceptance
-        run: |
-          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
-            brew install ffmpeg
-          fi
-          ffmpeg -version
-          ffprobe -version
+        run: scripts/ci/ensure-editing-ffmpeg.sh
       - name: Whitespace and conflict markers in the pushed commit
         run: |
           if git rev-parse HEAD~1 >/dev/null 2>&1; then

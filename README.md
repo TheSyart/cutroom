@@ -54,8 +54,10 @@ Cutroom 是面向 macOS 的开源 AI 视频剪辑工作台。把一段口播拖�
 ### 可选：本地媒体分析与 MP4 导出
 
 ```bash
-brew install ffmpeg whisper-cpp
+brew install ffmpeg-full whisper-cpp
 ```
+
+带字幕导出需要 FFmpeg 的 `subtitles` 滤镜。Cutroom 会在 Homebrew 的默认安装位置查找完整版。
 
 下载一个 ggml Whisper 模型（推荐 `ggml-small-q5_1.bin`，约 190MB；中文效果比 base 好）：
 

@@ -57,12 +57,7 @@ jobs:
       - name: Install the Playwright browser
         run: npm --prefix desktop exec -- playwright install chromium
       - name: Install FFmpeg and ffprobe for editing acceptance
-        run: |
-          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
-            brew install ffmpeg
-          fi
-          ffmpeg -version
-          ffprobe -version
+        run: scripts/ci/ensure-editing-ffmpeg.sh
       - name: Record OS runtime enforcement controls
         run: node scripts/ci/macos-runtime-context.mjs >runtime-context.json
       - name: Set the visual fixture locale and record font provenance

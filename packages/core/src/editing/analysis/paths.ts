@@ -40,6 +40,16 @@ export function findExecutable(
     ...CANDIDATES,
   ]
   for (const dir of dirs) {
+    // The full Homebrew build includes libass for burned-in captions.
+    if (
+      (name === 'ffmpeg' || name === 'ffprobe') &&
+      (dir === '/opt/homebrew/bin' || dir === '/usr/local/bin')
+    ) {
+      const full = executable(
+        join(dir, '..', 'opt', 'ffmpeg-full', 'bin', name),
+      )
+      if (full) return full
+    }
     const found = executable(join(dir, name))
     if (found) return found
   }

@@ -13,6 +13,7 @@ import {
 import { EmperorError } from '../errors'
 import { logger } from '../util/log'
 import { findExecutable } from './analysis/paths'
+import { withFilterGraphFile } from './analysis/media-process'
 import { renderMotionLayer, type RenderMotionFrame } from './motion-export'
 import { timelineLayout, zoomViewport } from './timeline'
 import {
@@ -416,71 +417,73 @@ export async function renderVideoProject(
     const output = join(temporary, 'output.mp4')
     let progressBuffer = ''
     let lastPercent = -1
-    await run(
-      options.ffmpegPath,
-      [
-        '-nostdin',
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-y',
-        '-filter_complex_threads',
-        '2',
-        ...inputs,
-        '-filter_complex_script',
-        'filters.txt',
-        '-map',
-        '[video]',
-        '-map',
-        '[audio]',
-        '-t',
-        time(layout.totalDuration),
-        '-c:v',
-        'libx264',
-        '-preset',
-        'fast',
-        '-crf',
-        '19',
-        '-pix_fmt',
-        'yuv420p',
-        '-threads',
-        '4',
-        '-c:a',
-        'aac',
-        '-b:a',
-        '192k',
-        '-movflags',
-        '+faststart',
-        '-progress',
-        'pipe:1',
-        output,
-      ],
-      signal,
-      temporary,
-      (chunk) => {
-        progressBuffer += chunk
-        const lines = progressBuffer.split('\n')
-        progressBuffer = lines.pop() ?? ''
-        for (const line of lines) {
-          if (!line.startsWith('out_time_us=')) continue
-          const timestamp = Number(line.slice('out_time_us='.length))
-          if (!Number.isFinite(timestamp)) continue
-          const percent = Math.max(
-            0,
-            Math.min(
-              99,
-              Math.floor(
-                (motionFrames ? 65 : 0) +
-                  ((motionFrames ? 0.35 : 1) * timestamp) /
-                    10_000 /
-                    layout.totalDuration,
+    await withFilterGraphFile((option) =>
+      run(
+        options.ffmpegPath,
+        [
+          '-nostdin',
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-y',
+          '-filter_complex_threads',
+          '2',
+          ...inputs,
+          option,
+          'filters.txt',
+          '-map',
+          '[video]',
+          '-map',
+          '[audio]',
+          '-t',
+          time(layout.totalDuration),
+          '-c:v',
+          'libx264',
+          '-preset',
+          'fast',
+          '-crf',
+          '19',
+          '-pix_fmt',
+          'yuv420p',
+          '-threads',
+          '4',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '192k',
+          '-movflags',
+          '+faststart',
+          '-progress',
+          'pipe:1',
+          output,
+        ],
+        signal,
+        temporary,
+        (chunk) => {
+          progressBuffer += chunk
+          const lines = progressBuffer.split('\n')
+          progressBuffer = lines.pop() ?? ''
+          for (const line of lines) {
+            if (!line.startsWith('out_time_us=')) continue
+            const timestamp = Number(line.slice('out_time_us='.length))
+            if (!Number.isFinite(timestamp)) continue
+            const percent = Math.max(
+              0,
+              Math.min(
+                99,
+                Math.floor(
+                  (motionFrames ? 65 : 0) +
+                    ((motionFrames ? 0.35 : 1) * timestamp) /
+                      10_000 /
+                      layout.totalDuration,
+                ),
               ),
-            ),
-          )
-          if (percent > lastPercent) options.onProgress?.(percent)
-          lastPercent = percent
-        }
-      },
+            )
+            if (percent > lastPercent) options.onProgress?.(percent)
+            lastPercent = percent
+          }
+        },
+      ),
     )
     checkCancelled(signal)
     if (!(await lstat(output)).size)

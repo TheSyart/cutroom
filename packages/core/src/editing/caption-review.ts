@@ -2,7 +2,11 @@ import { createEditingStaging } from './staging'
 import { writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runMedia, streamInput } from './analysis/media-process'
+import {
+  runMedia,
+  streamInput,
+  withFilterGraphFile,
+} from './analysis/media-process'
 import {
   captionAss,
   captionFrame,
@@ -182,80 +186,85 @@ export async function reviewCaptionFrames(
     ].join(';')
     const filterFile = join(work, 'filters.txt')
     await writeFile(filterFile, graph)
-    await runMedia(
-      ffmpeg,
-      [
-        '-nostdin',
-        '-v',
-        'error',
-        '-threads',
-        '4',
-        ...streamInput(file),
-        '-filter_complex_threads',
-        '2',
-        '-filter_complex_script',
-        filterFile,
-        '-map',
-        '[inspection]',
-        '-an',
-        '-fps_mode',
-        'passthrough',
-        '-pix_fmt',
-        'rgb24',
-        '-c:v',
-        'rawvideo',
-        '-threads',
-        '1',
-        '-f',
-        'rawvideo',
-        'pipe:1',
-      ],
-      {
-        cwd: work,
-        signal,
-        timeoutMs: 30 * 60_000,
-        onChunk(chunk, stream) {
-          if (stream !== 'stdout') return
-          for (let offset = 0; offset < chunk.length;) {
-            const written = chunk.copy(
-              frame,
-              filled,
-              offset,
-              offset + FRAME - filled,
-            )
-            offset += written
-            filled += written
-            if (filled !== FRAME) continue
-            const matched = samples.get(frames[index++]!) ?? []
-            const pixels = inspectFrame(frame, inkColor)
-            for (const cue of matched) {
-              result.checked++
-              if (
-                pixels.right < 0 ||
-                (pixels.opaque >= 4 &&
-                  pixels.matchingInk / pixels.opaque < 0.55)
+    await withFilterGraphFile((option) =>
+      runMedia(
+        ffmpeg,
+        [
+          '-nostdin',
+          '-v',
+          'error',
+          '-threads',
+          '4',
+          ...streamInput(file),
+          '-filter_complex_threads',
+          '2',
+          option,
+          filterFile,
+          '-map',
+          '[inspection]',
+          '-an',
+          '-fps_mode',
+          'passthrough',
+          '-pix_fmt',
+          'rgb24',
+          '-c:v',
+          'rawvideo',
+          '-threads',
+          '1',
+          '-f',
+          'rawvideo',
+          'pipe:1',
+        ],
+        {
+          cwd: work,
+          signal,
+          timeoutMs: 30 * 60_000,
+          onChunk(chunk, stream) {
+            if (stream !== 'stdout') return
+            for (let offset = 0; offset < chunk.length;) {
+              const written = chunk.copy(
+                frame,
+                filled,
+                offset,
+                offset + FRAME - filled,
               )
-                add(cue, 'caption_missing', '实际渲染帧没有匹配的字幕字形。')
-              else if (
-                pixels.left < (CAPTION_SAFE_X * WIDTH) / CAPTION_WIDTH - 3 ||
-                pixels.right >
-                  WIDTH - (CAPTION_SAFE_X * WIDTH) / CAPTION_WIDTH + 3 ||
-                pixels.top < (CAPTION_SAFE_Y * HEIGHT) / CAPTION_HEIGHT - 5 ||
-                pixels.bottom >
-                  HEIGHT - (CAPTION_SAFE_Y * HEIGHT) / CAPTION_HEIGHT + 5
-              )
-                add(cue, 'caption_overflow', '渲染字幕越过安全区。')
-              else if (pixels.edge < 4 || pixels.readable / pixels.edge < 0.58)
-                add(
-                  cue,
-                  'caption_contrast',
-                  '实际渲染帧上的字幕边缘对比度不足。',
+              offset += written
+              filled += written
+              if (filled !== FRAME) continue
+              const matched = samples.get(frames[index++]!) ?? []
+              const pixels = inspectFrame(frame, inkColor)
+              for (const cue of matched) {
+                result.checked++
+                if (
+                  pixels.right < 0 ||
+                  (pixels.opaque >= 4 &&
+                    pixels.matchingInk / pixels.opaque < 0.55)
                 )
+                  add(cue, 'caption_missing', '实际渲染帧没有匹配的字幕字形。')
+                else if (
+                  pixels.left < (CAPTION_SAFE_X * WIDTH) / CAPTION_WIDTH - 3 ||
+                  pixels.right >
+                    WIDTH - (CAPTION_SAFE_X * WIDTH) / CAPTION_WIDTH + 3 ||
+                  pixels.top < (CAPTION_SAFE_Y * HEIGHT) / CAPTION_HEIGHT - 5 ||
+                  pixels.bottom >
+                    HEIGHT - (CAPTION_SAFE_Y * HEIGHT) / CAPTION_HEIGHT + 5
+                )
+                  add(cue, 'caption_overflow', '渲染字幕越过安全区。')
+                else if (
+                  pixels.edge < 4 ||
+                  pixels.readable / pixels.edge < 0.58
+                )
+                  add(
+                    cue,
+                    'caption_contrast',
+                    '实际渲染帧上的字幕边缘对比度不足。',
+                  )
+              }
+              filled = 0
             }
-            filled = 0
-          }
+          },
         },
-      },
+      ),
     )
     for (const time of frames.slice(index))
       for (const cue of samples.get(time) ?? [])
